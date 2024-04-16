@@ -1,0 +1,7 @@
+title = Build System
+module = $BUILD_SYSTEM_JAR
+requirements = \
+  env:ISABELLE_SCALA_JAR
+sources = \
+  src/build_system.scala
+services = isabelle.Build_System_Tools
