@@ -1,0 +1,6 @@
+(* :mode=isabelle-options: *)
+
+section "Build System"
+
+option build_system_poll_delay : real = 60.0
+  -- "delay build system poll loop"
