@@ -10,6 +10,57 @@ import scala.annotation.tailrec
 
 
 object Build_System {
+  /* task queue synchronized via db */
+
+  enum Priority { case low, normal, high }
+
+  enum Version {
+    case Latest extends Version
+    case Local extends Version
+    case Revision(rev: String = "") extends Version
+  }
+
+  sealed case class Task(
+    kind: String,
+    options: Options,
+    id: UUID.T = UUID.random(),
+    submit_date: Date = Date.now(),
+    priority: Priority = Priority.normal,
+    isabelle_version: Version = Version.Latest,
+    afp_version: Option[Version] = None,
+    selection: Sessions.Selection = Sessions.Selection.empty,
+    build_heap: Boolean = false,
+    clean_build: Boolean = false,
+    export_files: Boolean = false,
+    fresh_build: Boolean = false,
+    presentation: Boolean = false
+  ) extends Library.Named { def name: String = id.toString }
+
+  sealed case class Job(
+    id: UUID.T,
+    kind: String,
+    serial: Long,
+    options: Options,
+    isabelle_version: String,
+    afp_version: String,
+    start_date: Date = Date.now(),
+    estimate: Option[Date] = None,
+    build: Option[Build_Job] = None
+  ) extends Library.Named { def name: String = id.toString }
+
+  object Queue {
+    def inc_serial(serial: Long): Long = {
+      require(serial < Long.MaxValue, "serial overflow")
+      serial + 1
+    }
+
+    type Running = Library.Update.Data[Job]
+    type Pending = Library.Update.Data[Task]
+  }
+
+  sealed case class Queue(serial: Long, running: Queue.Running, pending: Queue.Pending)
+
+
   /* poller listening to repository updates */
 
   class Poller(
