@@ -74,8 +74,15 @@ object Build_System {
     type Running = Library.Update.Data[Job]
   }
 
-  sealed case class Queue(serial: Long, pending: Queue.Pending, running: Queue.Running) {
+  sealed case class Queue(
+    serial: Long = 0,
+    pending: Queue.Pending = Map.empty,
+    running: Queue.Running = Map.empty
+  ) {
     def next_serial: Long = Queue.inc_serial(serial)
+    def of_kind(kind: String): List[Task] = pending.values.filter(_.kind == kind).toList
+    def add_pending(task: Task): Queue =
+      this.copy(pending = this.pending + (task.id.toString -> task))
   }
 
 
@@ -293,39 +300,114 @@ object Build_System {
   }
 
 
-  /* poller listening to repository updates */
+  /* active processes */
+
+  abstract class Process(store: Store) {
+    val options = store.options
+
+    private val _database =
+      try { store.open_database() }
+      catch { case exn: Throwable => close(); throw exn }
+
+    def close(): Unit = Option(_database).foreach(_.close())
+
+    protected var _queue = Queue()
+
+    protected def synchronized_database[A](label: String)(body: => A): A = synchronized {
+      Build_System.private_data.transaction_lock(_database, create = true, label = label) {
+        val old_queue = Build_System.private_data.pull_queue(_database, _queue)
+        _queue = old_queue
+        val res = body
+        _queue = Build_System.private_data.push_queue(_database, old_queue, _queue)
+        res
+      }
+    }
+
+    def run(): Future[Unit]
+  }
 
   class Poller(
-    options: Options,
-    repository: Mercurial.Repository = Mercurial.self_repository(),
+    store: Store,
+    isabelle_repository: Mercurial.Repository,
+    afp_repository: Mercurial.Repository,
     progress: Progress = new Progress
-  ) {
-    val initial_id = repository.id()
-    val poll_delay = options.seconds("build_system_poll_delay")
+  ) extends Process(store) {
+    val kind = "isabelle-all"
+    def task: Task =
+      Task(kind, afp_version = Some(Version.Latest), all_sessions = true, exclude_session_groups =
+        Sessions.bulky_groups.toList, presentation = true)
 
+    private val initial_id = isabelle_repository.id()
+    private val poll_delay = options.seconds("build_system_poll_delay")
     private def sleep(): Unit = poll_delay.sleep()
+
+    private def add_task(): Unit =
+      if (_queue.of_kind(kind).isEmpty) { _queue = _queue.add_pending(task) }
 
     @tailrec private def poll(id: String): Unit = {
       sleep()
 
-      Exn.capture {
-        repository.pull()
-        repository.id()
-      } match {
-        case Exn.Exn(exn) =>
-          progress.echo_warning("Could not poll repository: " + exn.getMessage)
-          poll(id)
-        case Exn.Res(id1) if id != id1 =>
-          progress.echo("Found new revision: " + id1)
-          poll(id1)
-        case _ => poll(id)
+      if (!progress.stopped) {
+        Exn.capture {
+          isabelle_repository.pull()
+          isabelle_repository.id()
+        } match {
+          case Exn.Exn(exn) =>
+            progress.echo_warning("Could not poll repository: " + exn.getMessage)
+            poll(id)
+          case Exn.Res(id1) if id != id1 =>
+            progress.echo("Found new revision: " + id1)
+            synchronized_database("Poller") { add_task() }
+            poll(id1)
+          case _ => poll(id)
+        }
       }
     }
 
-    def run(): Unit = {
-      progress.echo("Starting build system on " + initial_id)
-      poll(initial_id)
+    def run(): Future[Unit] = {
+      progress.echo("Starting build system poller on " + initial_id)
+      Future.thread("Poller") {
+        poll(initial_id)
+        close()
+      }
     }
+  }
+
+  
+  /* build system store */
+  
+  case class Store(options: Options) {
+    val base_dir = Path.explode(options.string("build_system_submission_dir"))
+    
+    def open_system(): SSH.System =
+      SSH.open_system(options,
+        host = options.string("build_system_ssh_host"),
+        port = options.int("build_system_ssh_port"),
+        user = options.string("build_system_ssh_user"))
+
+    def open_database(server: SSH.Server = SSH.no_server): PostgreSQL.Database =
+      PostgreSQL.open_database_server(options, server = server,
+        user = options.string("build_system_database_user"),
+        password = options.string("build_system_database_password"),
+        database = options.string("build_system_database_name"),
+        host = options.string("build_system_database_host"),
+        port = options.int("build_system_database_port"),
+        ssh_host = options.string("build_system_database_ssh_host"),
+        ssh_port = options.int("build_system_database_ssh_port"),
+        ssh_user = options.string("build_system_database_ssh_user"))
+  }
+
+  def build_system(
+    afp_root: Option[Path],
+    options: Options,
+    progress: Progress = new Progress
+  ): Unit = {
+    val store = Store(options)
+    val isabelle_repository = Mercurial.self_repository()
+    val afp_repository = Mercurial.repository(AFP.main_dir(afp_root.getOrElse(AFP.BASE)))
+
+    val processes = List(new Poller(store, isabelle_repository, afp_repository, progress))
+    progress.interrupt_handler(processes.map(_.run()).map(_.join))
   }
 
 
@@ -333,16 +415,19 @@ object Build_System {
 
   val isabelle_tool = Isabelle_Tool("build_system", "run build system", Scala_Project.here,
     { args =>
+      var afp_root: Option[Path] = None
       var options = Options.init()
 
       val getopts = Getopts("""
 Usage: isabelle build_system [OPTIONS]
 
   Options are:
+    -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
 
   Run Isabelle build system and server frontend.
 """,
+        "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "o:" -> (arg => options = options + arg))
 
       val more_args = getopts(args)
@@ -350,7 +435,7 @@ Usage: isabelle build_system [OPTIONS]
 
       val progress = new Console_Progress()
 
-      new Poller(options, progress = progress).run()
+      build_system(afp_root, options, progress)
     })
 }
 
