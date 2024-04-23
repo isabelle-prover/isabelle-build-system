@@ -49,7 +49,8 @@ object Build_System {
     clean_build: Boolean = false,
     export_files: Boolean = false,
     fresh_build: Boolean = false,
-    presentation: Boolean = false)
+    presentation: Boolean = false
+  ) extends Library.Named { def name: String = id.toString }
 
   sealed case class Job(
     id: UUID.T,
@@ -60,7 +61,8 @@ object Build_System {
     afp_version: Option[String],
     start_date: Date = Date.now(),
     estimate: Option[Date] = None,
-    build: Option[Build_Job] = None)
+    build: Option[Build_Job] = None
+  ) extends Library.Named { def name: String = id.toString }
 
   object Queue {
     def inc_serial(serial: Long): Long = {
@@ -68,11 +70,13 @@ object Build_System {
       serial + 1
     }
 
-    type Pending = Map[UUID.T, Task]
-    type Running = Map[UUID.T, Job]
+    type Pending = Library.Update.Data[Task]
+    type Running = Library.Update.Data[Job]
   }
 
-  sealed case class Queue(serial: Long, pending: Queue.Pending, running: Queue.Running)
+  sealed case class Queue(serial: Long, pending: Queue.Pending, running: Queue.Running) {
+    def next_serial: Long = Queue.inc_serial(serial)
+  }
 
 
   /* SQL data model */
@@ -91,23 +95,39 @@ object Build_System {
       val table = make_table(List(serial), name = "queue")
     }
 
-    def pull_queue(db: SQL.Database, old: Queue): Queue = {
-      val serial = db.execute_query_statementO[Long](
+    def read_serial(db: SQL.Database): Long =
+      db.execute_query_statementO[Long](
         Queue.table.select(List(Queue.serial.max)),
         _.long(Queue.serial)).getOrElse(0L)
-      if (serial == old.serial) old
-      else Build_System.Queue(serial, pull_pending(db), pull_running(db))
+
+    def pull_queue(db: SQL.Database, queue: Queue): Queue = {
+      val serial_db = read_serial(db)
+      if (serial_db == queue.serial) queue
+      else {
+        val serial = serial_db max queue.serial
+
+        val pending = pull_pending(db)
+        val running = pull_running(db)
+
+        queue.copy(serial = serial, pending = pending, running = running)
+      }
     }
 
-    def update_queue(db: SQL.Database, old: Queue, queue: Queue): Unit =
-      if (old.serial != queue.serial) {
-        db.execute_statement(Queue.table.delete(Queue.serial.where_equal(old.serial)))
-        db.execute_statement(Queue.table.insert(), { stmt =>
-          stmt.long(1) = queue.serial
-        })
-        update_pending(db, old.pending, queue.pending)
-        update_running(db, old.running, queue.running)
+    def push_queue(db: SQL.Database, old_queue: Queue, queue: Queue): Queue = {
+      val updates =
+        List(
+          update_pending(db, old_queue.pending, queue.pending),
+          update_running(db, old_queue.running, queue.running)
+        ).filter(_.defined)
+
+      if (updates.isEmpty) queue
+      else {
+        val serial = queue.next_serial
+        db.execute_statement(Queue.table.delete(Queue.serial.where_equal(old_queue.serial)))
+        db.execute_statement(Queue.table.insert(), { stmt => stmt.long(1) = queue.serial })
+        queue.copy(serial = serial)
       }
+    }
 
 
     /* pending */
@@ -142,10 +162,10 @@ object Build_System {
     }
 
     def pull_pending(db: SQL.Database): Build_System.Queue.Pending =
-      db.execute_query_statement(Pending.table.select(), Map.from[UUID.T, Task], get =
+      db.execute_query_statement(Pending.table.select(), Map.from[String, Task], get =
         { res =>
           val kind = res.string(Pending.kind)
-          val id = UUID.make(res.string(Pending.id))
+          val id = res.string(Pending.id)
           val submit_date = res.date(Pending.submit_date)
           val priority = Priority.valueOf(res.string(Pending.priority))
           val options = Options.Spec.parse(res.string(Pending.options))
@@ -165,46 +185,49 @@ object Build_System {
           val fresh_build = res.bool(Pending.fresh_build)
           val presentation = res.bool(Pending.presentation)
 
-          id -> Task(kind, id, submit_date, priority, options, isabelle_version, afp_version,
-            requirements, all_session, base_sessions, exclude_session_groups, exclude_sessions,
-            session_groups, sessions, build_heap, clean_build, export_files, fresh_build,
-            presentation)
+          id -> Task(kind, UUID.make(id), submit_date, priority, options, isabelle_version,
+            afp_version, requirements, all_session, base_sessions, exclude_session_groups,
+            exclude_sessions, session_groups, sessions, build_heap, clean_build, export_files,
+            fresh_build, presentation)
         })
 
     def update_pending(
       db: SQL.Database,
-      old: Build_System.Queue.Pending,
+      old_pending: Build_System.Queue.Pending,
       pending: Build_System.Queue.Pending
-    ): Unit = {
-      val delete = for ((id, elem) <- old if !pending.get(id).contains(elem)) yield id.toString
-      val insert = for ((id, elem) <- pending if !old.get(id).contains(elem)) yield elem
+    ): Library.Update = {
+      val update = Library.Update.make(old_pending, pending)
 
-      if (delete.nonEmpty)
-        db.execute_statement(Pending.table.delete(Pending.id.where_member(delete)))
-      if (insert.nonEmpty) {
+      if (update.deletes)
+        db.execute_statement(Pending.table.delete(Pending.id.where_member(update.delete)))
+
+      if (update.inserts) {
         db.execute_batch_statement(Pending.table.insert(), batch =
-          for (elem <- insert) yield { (stmt: SQL.Statement) =>
-            stmt.string(1) = elem.kind
-            stmt.string(2) = elem.id.toString
-            stmt.date(3) = elem.submit_date
-            stmt.string(4) = elem.priority.toString
-            stmt.string(5) = Options.Spec.bash_strings(elem.options)
-            stmt.string(6) = elem.isabelle_version.toString
-            stmt.string(7) = elem.afp_version.map(_.toString)
-            stmt.bool(8) = elem.requirements
-            stmt.bool(9) = elem.all_sessions
-            stmt.string(10) = elem.base_sessions.mkString(",")
-            stmt.string(11) = elem.exclude_session_groups.mkString(",")
-            stmt.string(12) = elem.exclude_sessions.mkString(",")
-            stmt.string(13) = elem.session_groups.mkString(",")
-            stmt.string(14) = elem.sessions.mkString(",")
-            stmt.bool(15) = elem.build_heap
-            stmt.bool(16) = elem.clean_build
-            stmt.bool(17) = elem.export_files
-            stmt.bool(18) = elem.fresh_build
-            stmt.bool(19) = elem.presentation
+          for (id <- update.insert) yield { (stmt: SQL.Statement) =>
+            val task = pending(id)
+            stmt.string(1) = task.kind
+            stmt.string(2) = id
+            stmt.date(3) = task.submit_date
+            stmt.string(4) = task.priority.toString
+            stmt.string(5) = Options.Spec.bash_strings(task.options)
+            stmt.string(6) = task.isabelle_version.toString
+            stmt.string(7) = task.afp_version.map(_.toString)
+            stmt.bool(8) = task.requirements
+            stmt.bool(9) = task.all_sessions
+            stmt.string(10) = task.base_sessions.mkString(",")
+            stmt.string(11) = task.exclude_session_groups.mkString(",")
+            stmt.string(12) = task.exclude_sessions.mkString(",")
+            stmt.string(13) = task.session_groups.mkString(",")
+            stmt.string(14) = task.sessions.mkString(",")
+            stmt.bool(15) = task.build_heap
+            stmt.bool(16) = task.clean_build
+            stmt.bool(17) = task.export_files
+            stmt.bool(18) = task.fresh_build
+            stmt.bool(19) = task.presentation
           })
       }
+
+      update
     }
 
 
@@ -227,9 +250,9 @@ object Build_System {
     }
 
     def pull_running(db: SQL.Database): Build_System.Queue.Running =
-      db.execute_query_statement(Running.table.select(), Map.from[UUID.T, Job], get =
+      db.execute_query_statement(Running.table.select(), Map.from[String, Job], get =
         { res =>
-          val id = UUID.make(res.string(Running.id))
+          val id = res.string(Running.id)
           val kind = res.string(Running.kind)
           val serial = res.long(Running.serial)
           val options = Options.Spec.parse(res.string(Running.options))
@@ -238,32 +261,34 @@ object Build_System {
           val start_date = res.date(Running.start_date)
           val estimate = res.get_date(Running.estimate)
 
-          id -> Job(id, kind, serial, options, isabelle_version, afp_version, start_date, estimate)
+          id -> Job(UUID.make(id), kind, serial, options, isabelle_version,
+            afp_version, start_date, estimate)
         })
 
     def update_running(
       db: SQL.Database,
-      old: Build_System.Queue.Running,
+      old_running: Build_System.Queue.Running,
       running: Build_System.Queue.Running
-    ): Unit = {
-      val delete = for ((id, elem) <- old if !running.get(id).contains(elem)) yield id.toString
-      val insert = for ((id, elem) <- running if !old.get(id).contains(elem)) yield elem
+    ): Library.Update = {
+      val update = Library.Update.make(old_running, running)
 
-      if (delete.nonEmpty)
-        db.execute_statement(Running.table.delete(Running.id.where_member(delete)))
-      if (insert.nonEmpty) {
+      if (update.deletes)
+        db.execute_statement(Running.table.delete(Running.id.where_member(update.delete)))
+      if (update.inserts) {
         db.execute_batch_statement(Running.table.insert(), batch =
-          for (elem <- insert) yield { (stmt: SQL.Statement) =>
-            stmt.string(1) = elem.id.toString
-            stmt.string(2) = elem.kind
-            stmt.long(3) = elem.serial
-            stmt.string(4) = Options.Spec.bash_strings(elem.options)
-            stmt.string(5) = elem.isabelle_version
-            stmt.string(6) = elem.afp_version
-            stmt.date(7) = elem.start_date
-            stmt.date(8) = elem.estimate
+          for (id <- update.insert) yield { (stmt: SQL.Statement) =>
+            val job = running(id)
+            stmt.string(1) = id
+            stmt.string(2) = job.kind
+            stmt.long(3) = job.serial
+            stmt.string(4) = Options.Spec.bash_strings(job.options)
+            stmt.string(5) = job.isabelle_version
+            stmt.string(6) = job.afp_version
+            stmt.date(7) = job.start_date
+            stmt.date(8) = job.estimate
           })
       }
+      update
     }
   }
 
