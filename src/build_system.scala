@@ -6,6 +6,8 @@ Isabelle system for automated and quasi-interactive build, with web frontend.
 package isabelle
 
 
+import isabelle.Build_System.State.max_serial
+
 import scala.annotation.tailrec
 
 
@@ -50,7 +52,24 @@ object Build_System {
     export_files: Boolean = false,
     fresh_build: Boolean = false,
     presentation: Boolean = false
-  ) extends Library.Named { def name: String = id.toString }
+  ) extends Library.Named {
+    def name: String = id.toString
+
+    def build_command(isabelle_home: Path = Path.current, afp_root: Option[Path]): String = {
+      File.bash_path(Isabelle_Tool.exe(isabelle_home)) + " build" +
+        if_proper(afp_root, " -A " + File.bash_path(afp_root.get)) +
+        base_sessions.map(session => " -B " + session).mkString +
+        if_proper(requirements, " -R") +
+        if_proper(all_sessions, " -a") +
+        if_proper(build_heap, " -b") +
+        if_proper(clean_build, " -c") +
+        if_proper(export_files, " -e") +
+        if_proper(fresh_build, " -f") +
+        if_proper(presentation, " -P:")
+        Options.Spec.bash_strings(options, bg = true) +
+        " -v"
+    }
+  }
 
   sealed case class Job(
     id: UUID.T,
@@ -61,20 +80,25 @@ object Build_System {
     afp_version: Option[String],
     start_date: Date = Date.now(),
     estimate: Option[Date] = None,
-    build: Option[Build_Job] = None
+    context: Option[Build_Context] = None
   ) extends Library.Named { def name: String = id.toString }
 
-  enum Status { case ok, failed, cancelled }
+  object Status {
+    def from_rc(rc: Int): Status = if (rc == 0) ok else failed
+  }
+
+  enum Status { case ok, cancelled, aborted, failed  }
 
   sealed case class Result(
     kind: String,
     number: Long,
     status: Status,
-    date: Date,
+    date: Date = Date.now(),
     serial: Long = 0,
   ) extends Library.Named { def name: String = kind + "/" + number }
 
   object State {
+    def max_serial(serials: Iterable[Long]): Long = serials.maxOption.getOrElse(0L)
     def inc_serial(serial: Long): Long = {
       require(serial < Long.MaxValue, "number overflow")
       serial + 1
@@ -92,9 +116,23 @@ object Build_System {
     finished: State.Finished = Map.empty
   ) {
     def next_serial: Long = State.inc_serial(serial)
-    def of_kind(kind: String): List[Task] = pending.values.filter(_.kind == kind).toList
-    def add_pending(task: Task): State = copy(pending = pending + (task.id.toString -> task))
-    def remove_running(id: String): State = copy(running = running - id)
+    
+    def add_pending(task: Task): State = copy(pending = pending + (task.name -> task))
+    def remove_pending(name: String): State = copy(pending = pending - name)
+
+    def next_pending: List[Task] =
+      if (pending.isEmpty) Nil
+      else {
+        val priority = pending.values.map(_.priority).maxBy(_.ordinal)
+        pending.values.filter(_.priority == priority).toList.sortBy(_.submit_date)(Date.Ordering)
+      }
+    
+    def add_running(job: Job): State = copy(running = running + (job.name -> job))
+    def remove_running(name: String): State = copy(running = running - name)
+    
+    def add_finished(result: Result): State = copy(finished = finished + (result.name -> result))
+    def num_finished(kind: String): Long =
+      State.max_serial(for ((_, result) <- finished if result.kind == kind) yield result.number)
   }
 
 
@@ -334,7 +372,7 @@ object Build_System {
       db: SQL.Database,
       finished: Build_System.State.Finished
     ): Build_System.State.Finished = {
-      val max_serial0 = finished.values.map(_.serial).maxOption.getOrElse(0L)
+      val max_serial0 = Build_System.State.max_serial(finished.values.map(_.serial))
       val max_serial1 = read_finished_serial(db)
       val missing = (max_serial0 + 1) to max_serial1
       db.execute_query_statement(
@@ -358,7 +396,7 @@ object Build_System {
       finished: Build_System.State.Finished
     ): Build_System.State.Finished = {
       val (insert0, old) = finished.partition(_._2.serial == 0L)
-      val max_serial = old.map(_._2.serial).maxOption.getOrElse(0L)
+      val max_serial = Build_System.State.max_serial(old.map(_._2.serial))
       val insert =
         for (((_, result), n) <- insert0.zipWithIndex)
         yield result.copy(serial = max_serial + 1 + n)
@@ -380,7 +418,7 @@ object Build_System {
 
   /* active processes */
 
-  abstract class Process(store: Store) {
+  abstract class Process(name: String, store: Store) {
     val options = store.options
 
     private val _database =
@@ -404,58 +442,177 @@ object Build_System {
     def run(): Future[Unit]
   }
 
-  class Poller(
+  abstract class Loop_Process[A](name: String, store: Store, progress: Progress)
+    extends Process(name, store) {
+    protected def delay = options.seconds("build_system_delay")
+
+    def init: A
+    def iterate(a: A): A
+
+    @tailrec private def loop(a: A): Unit =
+      if (!progress.stopped) {
+        val start = Date.now()
+        val a1 = iterate(a)
+        if (!progress.stopped) {
+          val elapsed = Date.now() - start
+          if (elapsed < delay) (delay - elapsed).sleep()
+          loop(a1)
+        }
+      }
+
+    override def run(): Future[Unit] = Future.thread(name) {
+      progress.echo("Started " + name)
+      loop(init)
+      close()
+    }
+  }
+
+  class Runner(
     store: Store,
     isabelle_repository: Mercurial.Repository,
     afp_repository: Mercurial.Repository,
-    progress: Progress = new Progress
-  ) extends Process(store) {
-    val kind = "isabelle-all"
-    def task =
-      Task(kind, priority = Priority.low, afp_version = Some(Version.Latest), all_sessions = true,
-        exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
+    progress: Progress
+  ) extends Loop_Process[Unit]("Runner", store, progress) {
+    val rsync_context = Rsync.Context()
 
-    private val initial_id = isabelle_repository.id()
-    private val poll_delay = options.seconds("build_system_poll_delay")
-    private def sleep(): Unit = poll_delay.sleep()
+    private def sync(repository: Mercurial.Repository, version: Version, target: Path): String = {
+      repository.synchronized { repository.pull() }
 
-    private def add_task(): Unit =
-      if (_state.of_kind(kind).isEmpty) { _state = _state.add_pending(task) }
+      version match {
+        case Version.Local =>
+        case Version.Latest => repository.sync(rsync_context, target, rev = "tip")
+        case Version.Revision(rev) => repository.sync(rsync_context, target, rev = rev)
+      }
 
-    @tailrec private def poll(id: String): Unit = {
-      sleep()
+      Exn.capture(repository.id(Mercurial.repository(target).id())) match {
+        case Exn.Res(res) => res
+        case Exn.Exn(exn) => "local"
+      }
+    }
 
-      if (!progress.stopped) {
+    private def start_next(): Option[Job] = synchronized_database("Runner.start_job") {
+      _state.next_pending.headOption.flatMap { task =>
+        _state = _state.remove_pending(task.name)
+        val kind = task.kind
+        val number = State.inc_serial(_state.num_finished(task.kind))
+        val context = Build_Context.make(store, kind, number, task)
+
         Exn.capture {
-          isabelle_repository.pull()
-          isabelle_repository.id()
+          val isabelle_version =
+            sync(isabelle_repository, task.isabelle_version, context.isabelle_dir)
+
+          val (afp_version, afp_dir) =
+            task.afp_version match {
+              case None => (None, None)
+              case Some(afp_version) =>
+                (Some(sync(afp_repository, afp_version, context.afp_dir)), Some(context.afp_dir))
+            }
+
+          Job(task.id, kind, number, task.options, isabelle_version, afp_version,
+            context = Some(context))
         } match {
+          case Exn.Res(job) =>
+            _state = _state.add_running(job)
+            Some(job)
           case Exn.Exn(exn) =>
-            progress.echo_warning("Could not poll repository: " + exn.getMessage)
-            poll(id)
-          case Exn.Res(id1) if id != id1 =>
-            progress.echo("Found new revision: " + id1)
-            synchronized_database("Poller") { add_task() }
-            poll(id1)
-          case _ => poll(id)
+            val msg = "Failed to start job: " + exn.getMessage
+            progress.echo_error_message(msg)
+            context.progress.echo_error_message(msg)
+            _state = _state.add_finished(Result(kind, number, Status.aborted))
+            None
         }
       }
     }
 
-    def run(): Future[Unit] =
-      Future.thread("Poller") {
-        progress.echo("Starting build system poller on " + initial_id)
-        poll(initial_id)
-        close()
+    private def finish_job(job: Job, result: Process_Result): Unit =
+      synchronized_database("Runner.finish_job") {
+        _state = _state.remove_running(job.name)
+        _state = _state.add_finished(Result(job.kind, job.number, Status.from_rc(result.rc)))
       }
+
+    def init: Unit = ()
+    def iterate(a: Unit): Unit = {
+      start_next() match {
+        case Some(job) =>
+          val result = job.context.get.run()
+          finish_job(job, result)
+        case None =>
+      }
+    }
+  }
+
+  class Poller(
+    store: Store,
+    isabelle_repository: Mercurial.Repository,
+    afp_repository: Mercurial.Repository,
+    progress: Progress
+  ) extends Loop_Process[(String, String)]("Poller", store, progress) {
+
+    override def delay = options.seconds("build_system_poll_delay")
+
+    val init: (String, String) = (isabelle_repository.id(), afp_repository.id())
+
+    val kind = "isabelle-all"
+    def task =
+      Task(kind, priority = Priority.low, afp_version = Some(Version.Latest), all_sessions = true,
+        exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
+    private def add_task(): Unit = synchronized_database("Poller.add_task") {
+      if (_state.pending.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
+    }
+
+    def iterate(ids: (String, String)): (String, String) = {
+      Exn.capture {
+        isabelle_repository.synchronized(isabelle_repository.pull())
+        afp_repository.synchronized(afp_repository.pull())
+        (isabelle_repository.id(), afp_repository.id())
+      } match {
+        case Exn.Exn(exn) =>
+          progress.echo_error_message("Could not reach repository: " + exn.getMessage)
+          ids
+        case Exn.Res(ids1) =>
+          if (ids != ids1) {
+            progress.echo("Found new revisions: " + ids1)
+            add_task()
+          }
+          ids1
+      }
+    }
+  }
+
+
+  /* build context */
+
+  object Build_Context {
+    def make(store: Store, kind: String, number: Long, task: Task): Build_Context = {
+      val base_dir = store.base_dir + Path.make(List(kind, number.toString))
+      Isabelle_System.make_directory(base_dir)
+      new Build_Context(base_dir, number, task)
+    }
+  }
+
+  class Build_Context private(val base_dir: Path, val number: Long, val task: Task) {
+    def isabelle_dir: Path = base_dir + Path.basic("isabelle")
+    def afp_dir: Path = base_dir + Path.basic("afp")
+    def afp_path: Option[Path] = if (task.afp_version.isDefined) Some(afp_dir) else None
+
+    def results_dir: Path = base_dir + Path.basic("results")
+    def log_file: Path = base_dir + Path.basic("log")
+
+    val progress = new File_Progress(log_file, verbose = true)
+    val isabelle = Other_Isabelle(isabelle_dir, progress = progress)
+
+    def run(): Process_Result = {
+      isabelle.init(fresh = task.fresh_build)
+      isabelle.bash(task.build_command(isabelle_dir, afp_path))
+    }
   }
 
 
   /* build system store */
-  
+
   case class Store(options: Options) {
     val base_dir = Path.explode(options.string("build_system_submission_dir"))
-    
+
     def open_system(): SSH.System =
       SSH.open_system(options,
         host = options.string("build_system_ssh_host"),
@@ -483,7 +640,9 @@ object Build_System {
     val isabelle_repository = Mercurial.self_repository()
     val afp_repository = Mercurial.repository(AFP.main_dir(afp_root.getOrElse(AFP.BASE)))
 
-    val processes = List(new Poller(store, isabelle_repository, afp_repository, progress))
+    val processes = List(
+      new Runner(store, isabelle_repository, afp_repository, progress),
+      new Poller(store, isabelle_repository, afp_repository, progress))
     progress.interrupt_handler(processes.map(_.run()).map(_.join))
   }
 

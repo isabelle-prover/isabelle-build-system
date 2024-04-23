@@ -2,6 +2,9 @@
 
 section "Build System"
 
+option build_system_delay : real = 1.0
+  -- "delay build system loop"
+
 option build_system_poll_delay : real = 60.0
   -- "delay build system poll loop"
 
