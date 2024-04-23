@@ -10,7 +10,7 @@ import scala.annotation.tailrec
 
 
 object Build_System {
-  /* task queue synchronized via db */
+  /* task state synchronized via db */
 
   enum Priority { case low, normal, high }
 
@@ -55,7 +55,7 @@ object Build_System {
   sealed case class Job(
     id: UUID.T,
     kind: String,
-    serial: Long,
+    number: Long,
     options: List[Options.Spec],
     isabelle_version: String,
     afp_version: Option[String],
@@ -64,25 +64,37 @@ object Build_System {
     build: Option[Build_Job] = None
   ) extends Library.Named { def name: String = id.toString }
 
-  object Queue {
+  enum Status { case ok, failed, cancelled }
+
+  sealed case class Result(
+    kind: String,
+    number: Long,
+    status: Status,
+    date: Date,
+    serial: Long = 0,
+  ) extends Library.Named { def name: String = kind + "/" + number }
+
+  object State {
     def inc_serial(serial: Long): Long = {
-      require(serial < Long.MaxValue, "serial overflow")
+      require(serial < Long.MaxValue, "number overflow")
       serial + 1
     }
 
     type Pending = Library.Update.Data[Task]
     type Running = Library.Update.Data[Job]
+    type Finished = Library.Update.Data[Result]
   }
 
-  sealed case class Queue(
+  sealed case class State(
     serial: Long = 0,
-    pending: Queue.Pending = Map.empty,
-    running: Queue.Running = Map.empty
+    pending: State.Pending = Map.empty,
+    running: State.Running = Map.empty,
+    finished: State.Finished = Map.empty
   ) {
-    def next_serial: Long = Queue.inc_serial(serial)
+    def next_serial: Long = State.inc_serial(serial)
     def of_kind(kind: String): List[Task] = pending.values.filter(_.kind == kind).toList
-    def add_pending(task: Task): Queue =
-      this.copy(pending = this.pending + (task.id.toString -> task))
+    def add_pending(task: Task): State = copy(pending = pending + (task.id.toString -> task))
+    def remove_running(id: String): State = copy(running = running - id)
   }
 
 
@@ -91,48 +103,50 @@ object Build_System {
   object private_data extends SQL.Data("isabelle_build_system") {
     /* tables */
 
-    override lazy val tables: SQL.Tables = SQL.Tables(Queue.table, Pending.table, Running.table)
+    override lazy val tables: SQL.Tables = SQL.Tables(State.table, Pending.table, Running.table)
 
 
-    /* queue */
+    /* state */
 
-    object Queue {
+    object State {
       val serial = SQL.Column.long("serial").make_primary_key
 
-      val table = make_table(List(serial), name = "queue")
+      val table = make_table(List(serial), name = "state")
     }
 
     def read_serial(db: SQL.Database): Long =
       db.execute_query_statementO[Long](
-        Queue.table.select(List(Queue.serial.max)),
-        _.long(Queue.serial)).getOrElse(0L)
+        State.table.select(List(State.serial.max)),
+        _.long(State.serial)).getOrElse(0L)
 
-    def pull_queue(db: SQL.Database, queue: Queue): Queue = {
+    def pull_state(db: SQL.Database, state: State): State = {
       val serial_db = read_serial(db)
-      if (serial_db == queue.serial) queue
+      if (serial_db == state.serial) state
       else {
-        val serial = serial_db max queue.serial
+        val serial = serial_db max state.serial
 
         val pending = pull_pending(db)
         val running = pull_running(db)
+        val finished = pull_finished(db, state.finished)
 
-        queue.copy(serial = serial, pending = pending, running = running)
+        state.copy(serial = serial, pending = pending, running = running, finished = finished)
       }
     }
 
-    def push_queue(db: SQL.Database, old_queue: Queue, queue: Queue): Queue = {
+    def push_state(db: SQL.Database, old_state: State, state: State): State = {
+      val finished = push_finished(db, old_state.finished, state.finished)
       val updates =
         List(
-          update_pending(db, old_queue.pending, queue.pending),
-          update_running(db, old_queue.running, queue.running)
+          update_pending(db, old_state.pending, state.pending),
+          update_running(db, old_state.running, state.running),
         ).filter(_.defined)
 
-      if (updates.isEmpty) queue
+      if (updates.isEmpty && finished == state.finished) state
       else {
-        val serial = queue.next_serial
-        db.execute_statement(Queue.table.delete(Queue.serial.where_equal(old_queue.serial)))
-        db.execute_statement(Queue.table.insert(), { stmt => stmt.long(1) = queue.serial })
-        queue.copy(serial = serial)
+        val serial = state.next_serial
+        db.execute_statement(State.table.delete(State.serial.where_equal(old_state.serial)))
+        db.execute_statement(State.table.insert(), body = { stmt => stmt.long(1) = state.serial })
+        state.copy(serial = serial, finished = finished)
       }
     }
 
@@ -168,7 +182,7 @@ object Build_System {
         name = "pending")
     }
 
-    def pull_pending(db: SQL.Database): Build_System.Queue.Pending =
+    def pull_pending(db: SQL.Database): Build_System.State.Pending =
       db.execute_query_statement(Pending.table.select(), Map.from[String, Task], get =
         { res =>
           val kind = res.string(Pending.kind)
@@ -200,8 +214,8 @@ object Build_System {
 
     def update_pending(
       db: SQL.Database,
-      old_pending: Build_System.Queue.Pending,
-      pending: Build_System.Queue.Pending
+      old_pending: Build_System.State.Pending,
+      pending: Build_System.State.Pending
     ): Library.Update = {
       val update = Library.Update.make(old_pending, pending)
 
@@ -210,7 +224,7 @@ object Build_System {
 
       if (update.inserts) {
         db.execute_batch_statement(Pending.table.insert(), batch =
-          for (id <- update.insert) yield { (stmt: SQL.Statement) =>
+          for (id <- update.insert) yield { stmt =>
             val task = pending(id)
             stmt.string(1) = task.kind
             stmt.string(2) = id
@@ -243,7 +257,7 @@ object Build_System {
     object Running {
       val id = SQL.Column.string("id").make_primary_key
       val kind = SQL.Column.string("kind")
-      val serial = SQL.Column.long("serial")
+      val number = SQL.Column.long("number")
       val options = SQL.Column.string("options")
       val isabelle_version = SQL.Column.string("isabelle_version")
       val afp_version = SQL.Column.string("afp_option")
@@ -251,31 +265,31 @@ object Build_System {
       val estimate = SQL.Column.date("estimate")
 
       val table =
-        make_table(List(id, kind, serial, options, isabelle_version,
+        make_table(List(id, kind, number, options, isabelle_version,
           afp_version, start_date, estimate),
         name = "running")
     }
 
-    def pull_running(db: SQL.Database): Build_System.Queue.Running =
+    def pull_running(db: SQL.Database): Build_System.State.Running =
       db.execute_query_statement(Running.table.select(), Map.from[String, Job], get =
         { res =>
           val id = res.string(Running.id)
           val kind = res.string(Running.kind)
-          val serial = res.long(Running.serial)
+          val number = res.long(Running.number)
           val options = Options.Spec.parse(res.string(Running.options))
           val isabelle_version = res.string(Running.isabelle_version)
           val afp_version = res.get_string(Running.afp_version)
           val start_date = res.date(Running.start_date)
           val estimate = res.get_date(Running.estimate)
 
-          id -> Job(UUID.make(id), kind, serial, options, isabelle_version,
+          id -> Job(UUID.make(id), kind, number, options, isabelle_version,
             afp_version, start_date, estimate)
         })
 
     def update_running(
       db: SQL.Database,
-      old_running: Build_System.Queue.Running,
-      running: Build_System.Queue.Running
+      old_running: Build_System.State.Running,
+      running: Build_System.State.Running
     ): Library.Update = {
       val update = Library.Update.make(old_running, running)
 
@@ -283,11 +297,11 @@ object Build_System {
         db.execute_statement(Running.table.delete(Running.id.where_member(update.delete)))
       if (update.inserts) {
         db.execute_batch_statement(Running.table.insert(), batch =
-          for (id <- update.insert) yield { (stmt: SQL.Statement) =>
+          for (id <- update.insert) yield { stmt =>
             val job = running(id)
             stmt.string(1) = id
             stmt.string(2) = job.kind
-            stmt.long(3) = job.serial
+            stmt.long(3) = job.number
             stmt.string(4) = Options.Spec.bash_strings(job.options)
             stmt.string(5) = job.isabelle_version
             stmt.string(6) = job.afp_version
@@ -296,6 +310,70 @@ object Build_System {
           })
       }
       update
+    }
+
+
+    /* finished */
+
+    object Finished {
+      val kind = SQL.Column.string("kind")
+      val number = SQL.Column.long("number")
+      val status = SQL.Column.string("status")
+      val date = SQL.Column.date("date")
+      val serial = SQL.Column.long("serial").make_primary_key
+
+      val table = make_table(List(kind, number, status, date, serial), name = "finished")
+    }
+
+    def read_finished_serial(db: SQL.Database): Long =
+      db.execute_query_statementO[Long](
+        Finished.table.select(List(Finished.serial.max)),
+        _.long(Finished.serial)).getOrElse(0L)
+
+    def pull_finished(
+      db: SQL.Database,
+      finished: Build_System.State.Finished
+    ): Build_System.State.Finished = {
+      val max_serial0 = finished.values.map(_.serial).maxOption.getOrElse(0L)
+      val max_serial1 = read_finished_serial(db)
+      val missing = (max_serial0 + 1) to max_serial1
+      db.execute_query_statement(
+        Finished.table.select(sql = Finished.serial.where_member_long(missing)),
+        Map.from[String, Result], get =
+        { res =>
+          val kind = res.string(Finished.kind)
+          val number = res.long(Finished.number)
+          val status = Status.valueOf(res.string(Finished.status))
+          val date = res.date(Finished.date)
+          val serial = res.long(Finished.serial)
+
+          serial.toString -> Result(kind, number, status, date, serial)
+        }
+      )
+    }
+
+    def push_finished(
+      db: SQL.Database,
+      old_finished: Build_System.State.Finished,
+      finished: Build_System.State.Finished
+    ): Build_System.State.Finished = {
+      val (insert0, old) = finished.partition(_._2.serial == 0L)
+      val max_serial = old.map(_._2.serial).maxOption.getOrElse(0L)
+      val insert =
+        for (((_, result), n) <- insert0.zipWithIndex)
+        yield result.copy(serial = max_serial + 1 + n)
+
+      if (insert.nonEmpty)
+        db.execute_batch_statement(Finished.table.insert(), batch =
+        for (result <- insert) yield { stmt =>
+          stmt.string(1) = result.kind
+          stmt.long(2) = result.number
+          stmt.string(3) = result.status.toString
+          stmt.date(4) = result.date
+          stmt.long(5) = result.serial
+        })
+
+      old ++ insert.map(result => result.serial.toString -> result)
     }
   }
 
@@ -311,14 +389,14 @@ object Build_System {
 
     def close(): Unit = Option(_database).foreach(_.close())
 
-    protected var _queue = Queue()
+    protected var _state = State()
 
     protected def synchronized_database[A](label: String)(body: => A): A = synchronized {
       Build_System.private_data.transaction_lock(_database, create = true, label = label) {
-        val old_queue = Build_System.private_data.pull_queue(_database, _queue)
-        _queue = old_queue
+        val old_state = Build_System.private_data.pull_state(_database, _state)
+        _state = old_state
         val res = body
-        _queue = Build_System.private_data.push_queue(_database, old_queue, _queue)
+        _state = Build_System.private_data.push_state(_database, old_state, _state)
         res
       }
     }
@@ -333,16 +411,16 @@ object Build_System {
     progress: Progress = new Progress
   ) extends Process(store) {
     val kind = "isabelle-all"
-    def task: Task =
-      Task(kind, afp_version = Some(Version.Latest), all_sessions = true, exclude_session_groups =
-        Sessions.bulky_groups.toList, presentation = true)
+    def task =
+      Task(kind, priority = Priority.low, afp_version = Some(Version.Latest), all_sessions = true,
+        exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
 
     private val initial_id = isabelle_repository.id()
     private val poll_delay = options.seconds("build_system_poll_delay")
     private def sleep(): Unit = poll_delay.sleep()
 
     private def add_task(): Unit =
-      if (_queue.of_kind(kind).isEmpty) { _queue = _queue.add_pending(task) }
+      if (_state.of_kind(kind).isEmpty) { _state = _state.add_pending(task) }
 
     @tailrec private def poll(id: String): Unit = {
       sleep()
@@ -364,16 +442,15 @@ object Build_System {
       }
     }
 
-    def run(): Future[Unit] = {
-      progress.echo("Starting build system poller on " + initial_id)
+    def run(): Future[Unit] =
       Future.thread("Poller") {
+        progress.echo("Starting build system poller on " + initial_id)
         poll(initial_id)
         close()
       }
-    }
   }
 
-  
+
   /* build system store */
   
   case class Store(options: Options) {
