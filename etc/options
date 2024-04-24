@@ -11,6 +11,9 @@ option build_system_poll_delay : real = 60.0
 option build_system_submission_dir : string = "/p/home/isabelle/build"
   -- "directory for submissions on build server"
 
+option build_system_identifier : string = "build_system"
+  -- "isabelle identifier for build system processes"
+
 section "Build System SSH"
 
 option build_system_ssh_host : string = "of1.proof.cit.tum.de" for connection

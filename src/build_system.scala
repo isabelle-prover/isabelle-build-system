@@ -57,16 +57,17 @@ object Build_System {
     def build_command(isabelle_home: Path = Path.current, afp_root: Option[Path]): String = {
       File.bash_path(Isabelle_Tool.exe(isabelle_home)) + " build" +
         if_proper(afp_root, " -A " + File.bash_path(afp_root.get)) +
-        base_sessions.map(session => " -B " + session).mkString +
+        base_sessions.map(session => " -B " + Bash.string(session)).mkString +
         if_proper(requirements, " -R") +
         if_proper(all_sessions, " -a") +
         if_proper(build_heap, " -b") +
         if_proper(clean_build, " -c") +
         if_proper(export_files, " -e") +
         if_proper(fresh_build, " -f") +
-        if_proper(presentation, " -P:")
+        if_proper(presentation, " -P:") +
         Options.Spec.bash_strings(prefs, bg = true) +
-        " -v"
+        " -v" +
+        sessions.map(session => " " + Bash.string(session)).mkString
     }
   }
 
@@ -140,7 +141,8 @@ object Build_System {
   object private_data extends SQL.Data("isabelle_build_system") {
     /* tables */
 
-    override lazy val tables: SQL.Tables = SQL.Tables(State.table, Pending.table, Running.table)
+    override lazy val tables: SQL.Tables =
+      SQL.Tables(State.table, Pending.table, Running.table, Finished.table)
 
 
     /* state */
@@ -171,18 +173,18 @@ object Build_System {
     }
 
     def push_state(db: SQL.Database, old_state: State, state: State): State = {
-      val finished = push_finished(db, old_state.finished, state.finished)
+      val finished = push_finished(db, state.finished)
       val updates =
         List(
           update_pending(db, old_state.pending, state.pending),
           update_running(db, old_state.running, state.running),
         ).filter(_.defined)
 
-      if (updates.isEmpty && finished == state.finished) state
+      if (updates.isEmpty && finished == old_state.finished) state
       else {
         val serial = state.next_serial
         db.execute_statement(State.table.delete(State.serial.where_equal(old_state.serial)))
-        db.execute_statement(State.table.insert(), body = { stmt => stmt.long(1) = state.serial })
+        db.execute_statement(State.table.insert(), body = { stmt => stmt.long(1) = serial })
         state.copy(serial = serial, finished = finished)
       }
     }
@@ -374,7 +376,7 @@ object Build_System {
       val max_serial0 = Build_System.State.max_serial(finished.values.map(_.serial))
       val max_serial1 = read_finished_serial(db)
       val missing = (max_serial0 + 1) to max_serial1
-      db.execute_query_statement(
+      finished ++ db.execute_query_statement(
         Finished.table.select(sql = Finished.serial.where_member_long(missing)),
         Map.from[String, Result], get =
         { res =>
@@ -391,24 +393,23 @@ object Build_System {
 
     def push_finished(
       db: SQL.Database,
-      old_finished: Build_System.State.Finished,
       finished: Build_System.State.Finished
     ): Build_System.State.Finished = {
       val (insert0, old) = finished.partition(_._2.serial == 0L)
-      val max_serial = Build_System.State.max_serial(old.map(_._2.serial))
+      val max_serial = Build_System.State.max_serial(finished.map(_._2.serial))
       val insert =
         for (((_, result), n) <- insert0.zipWithIndex)
         yield result.copy(serial = max_serial + 1 + n)
 
       if (insert.nonEmpty)
         db.execute_batch_statement(Finished.table.insert(), batch =
-        for (result <- insert) yield { stmt =>
-          stmt.string(1) = result.kind
-          stmt.long(2) = result.number
-          stmt.string(3) = result.status.toString
-          stmt.date(4) = result.date
-          stmt.long(5) = result.serial
-        })
+          for (result <- insert) yield { stmt =>
+            stmt.string(1) = result.kind
+            stmt.long(2) = result.number
+            stmt.string(3) = result.status.toString
+            stmt.date(4) = result.date
+            stmt.long(5) = result.serial
+          })
 
       old ++ insert.map(result => result.serial.toString -> result)
     }
@@ -463,6 +464,7 @@ object Build_System {
       progress.echo("Started " + name)
       loop(init)
       close()
+      progress.echo("Stopped " + name)
     }
   }
 
@@ -491,6 +493,7 @@ object Build_System {
 
     private def start_next(): Option[Job] = synchronized_database("Runner.start_job") {
       _state.next_pending.headOption.flatMap { task =>
+        progress.echo("Initializing task " + task.id)
         _state = _state.remove_pending(task.name)
         val context = Build_Context.make(store, task)
         val number = State.inc_serial(_state.num_finished(task.kind))
@@ -524,6 +527,7 @@ object Build_System {
 
     private def finish_job(job: Job, result: Process_Result): Unit =
       synchronized_database("Runner.finish_job") {
+        progress.echo("Finished job " + job.id + " with status code " + result.rc)
         _state = _state.remove_running(job.name)
         _state = _state.add_finished(Result(job.kind, job.number, Status.from_rc(result.rc)))
       }
@@ -532,7 +536,11 @@ object Build_System {
     def iterate(a: Unit): Unit = {
       start_next() match {
         case Some(job) =>
-          val result = job.context.get.run()
+          progress.echo("Running job " + job.id)
+          val context = job.context.get
+
+          val result = context.run()
+
           finish_job(job, result)
         case None =>
       }
@@ -558,7 +566,7 @@ object Build_System {
       if (_state.pending.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
     }
 
-    def iterate(ids: (String, String)): (String, String) = {
+    def iterate(ids: (String, String)): (String, String) =
       Exn.capture {
         isabelle_repository.synchronized(isabelle_repository.pull())
         afp_repository.synchronized(afp_repository.pull())
@@ -574,11 +582,16 @@ object Build_System {
           }
           ids1
       }
-    }
   }
 
-  class Submitter(task: Task, store: Store) extends Process("Submitter", store) {
-    override def run(): Future[Unit] = Future.fork { _state = _state.add_pending(task) }
+  class Submitter(task: Task, store: Store, progress: Progress)
+    extends Process("Submitter", store) {
+
+    private def add_task(): Unit = synchronized_database("Submitter.add_task") {
+      progress.echo("Submitting task " + task.id)
+      _state = _state.add_pending(task)
+    }
+    override def run(): Future[Unit] = Future.fork { add_task() }
   }
 
 
@@ -588,24 +601,28 @@ object Build_System {
     def make(store: Store, task: Task): Build_Context = {
       val base_dir = store.base_dir + Path.basic(task.id.toString)
       Isabelle_System.make_directory(base_dir)
-      new Build_Context(base_dir, task)
+      new Build_Context(store, base_dir, task)
     }
   }
 
-  class Build_Context private(val base_dir: Path, val task: Task) {
+  class Build_Context private(store: Store, val base_dir: Path, val task: Task) {
     def isabelle_dir: Path = base_dir + Path.basic("isabelle")
-    def afp_dir: Path = base_dir + Path.basic("afp")
+    def afp_dir: Path = isabelle_dir + Path.basic("AFP")
     def afp_path: Option[Path] = if (task.afp_version.isDefined) Some(afp_dir) else None
 
     def results_dir: Path = base_dir + Path.basic("results")
     def log_file: Path = base_dir + Path.basic("log")
 
     val progress = new File_Progress(log_file, verbose = true)
-    val isabelle = Other_Isabelle(isabelle_dir, progress = progress)
+
+    def isabelle =
+      Other_Isabelle(isabelle_dir, store.build_system_identifier, store.open_ssh(), progress)
 
     def run(): Process_Result = {
-      isabelle.init(fresh = task.fresh_build)
-      isabelle.bash(task.build_command(isabelle_dir, afp_path))
+      isabelle.init(fresh = task.fresh_build, echo = true)
+      val cmd = task.build_command(isabelle_dir, afp_path)
+      progress.echo(cmd)
+      isabelle.bash(cmd, echo = true)
     }
   }
 
@@ -614,8 +631,9 @@ object Build_System {
 
   case class Store(options: Options) {
     val base_dir = Path.explode(options.string("build_system_submission_dir"))
+    val build_system_identifier = options.string("build_system_identifier")
 
-    def open_system(): SSH.System =
+    def open_ssh(): SSH.System =
       SSH.open_system(options,
         host = options.string("build_system_ssh_host"),
         port = options.int("build_system_ssh_port"),
@@ -640,7 +658,7 @@ object Build_System {
   ): Unit = {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
-    val afp_repository = Mercurial.repository(AFP.main_dir(afp_root.getOrElse(AFP.BASE)))
+    val afp_repository = Mercurial.repository(afp_root.getOrElse(AFP.BASE))
 
     val processes = List(
       new Runner(store, isabelle_repository, afp_repository, progress),
@@ -676,14 +694,15 @@ object Build_System {
     val build_context = Build_Context.make(store, task)
 
     progress.interrupt_handler {
-      using(store.open_system()) { ssh =>
-        val context = Rsync.Context(progress = progress, ssh = ssh)
-        Sync.sync(store.options, context, build_context.base_dir, afp_root = afp_root)
+      using(store.open_ssh()) { ssh =>
+        val context = Rsync.Context(ssh = ssh)
+        progress.echo("Transferring repositories...")
+        Sync.sync(store.options, context, build_context.isabelle_dir, afp_root = afp_root)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
           ssh.delete(build_context.base_dir)
         } else {
-          val submitter = new Submitter(task, store)
+          val submitter = new Submitter(task, store, progress)
           submitter.run().join
         }
       }
@@ -802,4 +821,5 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
     })
 }
 
-class Build_System_Tools extends Isabelle_Scala_Tools(Build_System.isabelle_tool)
+class Build_System_Tools extends Isabelle_Scala_Tools(
+  Build_System.isabelle_tool, Build_System.isabelle_tool1)
