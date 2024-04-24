@@ -6,8 +6,7 @@ Isabelle system for automated and quasi-interactive build, with web frontend.
 package isabelle
 
 
-import isabelle.Build_System.State.max_serial
-
+import scala.collection.mutable
 import scala.annotation.tailrec
 
 
@@ -37,7 +36,7 @@ object Build_System {
     id: UUID.T = UUID.random(),
     submit_date: Date = Date.now(),
     priority: Priority = Priority.normal,
-    options: List[Options.Spec] = Nil,
+    prefs: List[Options.Spec] = Nil,
     isabelle_version: Version = Version.Latest,
     afp_version: Option[Version] = None,
     requirements: Boolean = false,
@@ -66,7 +65,7 @@ object Build_System {
         if_proper(export_files, " -e") +
         if_proper(fresh_build, " -f") +
         if_proper(presentation, " -P:")
-        Options.Spec.bash_strings(options, bg = true) +
+        Options.Spec.bash_strings(prefs, bg = true) +
         " -v"
     }
   }
@@ -75,7 +74,7 @@ object Build_System {
     id: UUID.T,
     kind: String,
     number: Long,
-    options: List[Options.Spec],
+    prefs: List[Options.Spec],
     isabelle_version: String,
     afp_version: Option[String],
     start_date: Date = Date.now(),
@@ -116,7 +115,7 @@ object Build_System {
     finished: State.Finished = Map.empty
   ) {
     def next_serial: Long = State.inc_serial(serial)
-    
+
     def add_pending(task: Task): State = copy(pending = pending + (task.name -> task))
     def remove_pending(name: String): State = copy(pending = pending - name)
 
@@ -126,10 +125,10 @@ object Build_System {
         val priority = pending.values.map(_.priority).maxBy(_.ordinal)
         pending.values.filter(_.priority == priority).toList.sortBy(_.submit_date)(Date.Ordering)
       }
-    
+
     def add_running(job: Job): State = copy(running = running + (job.name -> job))
     def remove_running(name: String): State = copy(running = running - name)
-    
+
     def add_finished(result: Result): State = copy(finished = finished + (result.name -> result))
     def num_finished(kind: String): Long =
       State.max_serial(for ((_, result) <- finished if result.kind == kind) yield result.number)
@@ -196,7 +195,7 @@ object Build_System {
       val id = SQL.Column.string("id").make_primary_key
       val submit_date = SQL.Column.date("submit_date")
       val priority = SQL.Column.string("priority")
-      val options = SQL.Column.string("options")
+      val prefs = SQL.Column.string("prefs")
       val isabelle_version = SQL.Column.string("isabelle_version")
       val afp_version = SQL.Column.string("afp_version")
       val requirements = SQL.Column.bool("requirements")
@@ -213,7 +212,7 @@ object Build_System {
       val presentation = SQL.Column.bool("presentation")
 
       val table =
-        make_table(List(kind, id, submit_date, priority, options, isabelle_version, afp_version,
+        make_table(List(kind, id, submit_date, priority, prefs, isabelle_version, afp_version,
           requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
           session_groups, sessions, build_heap, clean_build, export_files, fresh_build,
           presentation),
@@ -227,7 +226,7 @@ object Build_System {
           val id = res.string(Pending.id)
           val submit_date = res.date(Pending.submit_date)
           val priority = Priority.valueOf(res.string(Pending.priority))
-          val options = Options.Spec.parse(res.string(Pending.options))
+          val prefs = Options.Spec.parse(res.string(Pending.prefs))
           val isabelle_version = Version.parse(res.string(Pending.isabelle_version))
           val afp_version = res.get_string(Pending.afp_version).map(Version.parse)
           val requirements = res.bool(Pending.requirements)
@@ -244,7 +243,7 @@ object Build_System {
           val fresh_build = res.bool(Pending.fresh_build)
           val presentation = res.bool(Pending.presentation)
 
-          id -> Task(kind, UUID.make(id), submit_date, priority, options, isabelle_version,
+          id -> Task(kind, UUID.make(id), submit_date, priority, prefs, isabelle_version,
             afp_version, requirements, all_session, base_sessions, exclude_session_groups,
             exclude_sessions, session_groups, sessions, build_heap, clean_build, export_files,
             fresh_build, presentation)
@@ -268,7 +267,7 @@ object Build_System {
             stmt.string(2) = id
             stmt.date(3) = task.submit_date
             stmt.string(4) = task.priority.toString
-            stmt.string(5) = Options.Spec.bash_strings(task.options)
+            stmt.string(5) = Options.Spec.bash_strings(task.prefs)
             stmt.string(6) = task.isabelle_version.toString
             stmt.string(7) = task.afp_version.map(_.toString)
             stmt.bool(8) = task.requirements
@@ -296,14 +295,14 @@ object Build_System {
       val id = SQL.Column.string("id").make_primary_key
       val kind = SQL.Column.string("kind")
       val number = SQL.Column.long("number")
-      val options = SQL.Column.string("options")
+      val prefs = SQL.Column.string("prefs")
       val isabelle_version = SQL.Column.string("isabelle_version")
       val afp_version = SQL.Column.string("afp_option")
       val start_date = SQL.Column.date("start_date")
       val estimate = SQL.Column.date("estimate")
 
       val table =
-        make_table(List(id, kind, number, options, isabelle_version,
+        make_table(List(id, kind, number, prefs, isabelle_version,
           afp_version, start_date, estimate),
         name = "running")
     }
@@ -314,13 +313,13 @@ object Build_System {
           val id = res.string(Running.id)
           val kind = res.string(Running.kind)
           val number = res.long(Running.number)
-          val options = Options.Spec.parse(res.string(Running.options))
+          val prefs = Options.Spec.parse(res.string(Running.prefs))
           val isabelle_version = res.string(Running.isabelle_version)
           val afp_version = res.get_string(Running.afp_version)
           val start_date = res.date(Running.start_date)
           val estimate = res.get_date(Running.estimate)
 
-          id -> Job(UUID.make(id), kind, number, options, isabelle_version,
+          id -> Job(UUID.make(id), kind, number, prefs, isabelle_version,
             afp_version, start_date, estimate)
         })
 
@@ -340,7 +339,7 @@ object Build_System {
             stmt.string(1) = id
             stmt.string(2) = job.kind
             stmt.long(3) = job.number
-            stmt.string(4) = Options.Spec.bash_strings(job.options)
+            stmt.string(4) = Options.Spec.bash_strings(job.prefs)
             stmt.string(5) = job.isabelle_version
             stmt.string(6) = job.afp_version
             stmt.date(7) = job.start_date
@@ -416,7 +415,7 @@ object Build_System {
   }
 
 
-  /* active processes */
+  /* active processes: runner, poller */
 
   abstract class Process(name: String, store: Store) {
     val options = store.options
@@ -493,9 +492,8 @@ object Build_System {
     private def start_next(): Option[Job] = synchronized_database("Runner.start_job") {
       _state.next_pending.headOption.flatMap { task =>
         _state = _state.remove_pending(task.name)
-        val kind = task.kind
+        val context = Build_Context.make(store, task)
         val number = State.inc_serial(_state.num_finished(task.kind))
-        val context = Build_Context.make(store, kind, number, task)
 
         Exn.capture {
           val isabelle_version =
@@ -508,7 +506,7 @@ object Build_System {
                 (Some(sync(afp_repository, afp_version, context.afp_dir)), Some(context.afp_dir))
             }
 
-          Job(task.id, kind, number, task.options, isabelle_version, afp_version,
+          Job(task.id, task.kind, number, task.prefs, isabelle_version, afp_version,
             context = Some(context))
         } match {
           case Exn.Res(job) =>
@@ -518,7 +516,7 @@ object Build_System {
             val msg = "Failed to start job: " + exn.getMessage
             progress.echo_error_message(msg)
             context.progress.echo_error_message(msg)
-            _state = _state.add_finished(Result(kind, number, Status.aborted))
+            _state = _state.add_finished(Result(task.kind, number, Status.aborted))
             None
         }
       }
@@ -579,18 +577,22 @@ object Build_System {
     }
   }
 
+  class Submitter(task: Task, store: Store) extends Process("Submitter", store) {
+    override def run(): Future[Unit] = Future.fork { _state = _state.add_pending(task) }
+  }
+
 
   /* build context */
 
   object Build_Context {
-    def make(store: Store, kind: String, number: Long, task: Task): Build_Context = {
-      val base_dir = store.base_dir + Path.make(List(kind, number.toString))
+    def make(store: Store, task: Task): Build_Context = {
+      val base_dir = store.base_dir + Path.basic(task.id.toString)
       Isabelle_System.make_directory(base_dir)
-      new Build_Context(base_dir, number, task)
+      new Build_Context(base_dir, task)
     }
   }
 
-  class Build_Context private(val base_dir: Path, val number: Long, val task: Task) {
+  class Build_Context private(val base_dir: Path, val task: Task) {
     def isabelle_dir: Path = base_dir + Path.basic("isabelle")
     def afp_dir: Path = base_dir + Path.basic("afp")
     def afp_path: Option[Path] = if (task.afp_version.isDefined) Some(afp_dir) else None
@@ -646,6 +648,50 @@ object Build_System {
     progress.interrupt_handler(processes.map(_.run()).map(_.join))
   }
 
+  def submit_build(
+    store: Store,
+    afp_root: Option[Path] = None,
+    base_sessions: List[String] = Nil,
+    presentation: Boolean = false,
+    requirements: Boolean = false,
+    exclude_session_groups: List[String] = Nil,
+    all_sessions: Boolean = false,
+    build_heap: Boolean = false,
+    clean_build: Boolean = false,
+    export_files: Boolean = false,
+    fresh_build: Boolean = false,
+    session_groups: List[String] = Nil,
+    sessions: List[String] = Nil,
+    prefs: List[Options.Spec] = Nil,
+    exclude_sessions: List[String] = Nil,
+    progress: Progress = new Progress
+  ): UUID.T = {
+    val id = UUID.random()
+    val afp_version = if (afp_root.nonEmpty) Some(Version.Local) else None
+
+    val task = Task("submission", id, Date.now(), Priority.high, prefs, Version.Local, afp_version,
+      requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
+      session_groups, sessions, build_heap, clean_build, export_files, fresh_build, presentation)
+
+    val build_context = Build_Context.make(store, task)
+
+    progress.interrupt_handler {
+      using(store.open_system()) { ssh =>
+        val context = Rsync.Context(progress = progress, ssh = ssh)
+        Sync.sync(store.options, context, build_context.base_dir, afp_root = afp_root)
+        if (progress.stopped) {
+          progress.echo("Cancelling submission...")
+          ssh.delete(build_context.base_dir)
+        } else {
+          val submitter = new Submitter(task, store)
+          submitter.run().join
+        }
+      }
+    }
+
+    id
+  }
+
 
   /* Isabelle tool wrapper */
 
@@ -671,7 +717,88 @@ Usage: isabelle build_system [OPTIONS]
 
       val progress = new Console_Progress()
 
-      build_system(afp_root, options, progress)
+      build_system(afp_root = afp_root, options = options, progress = progress)
+    })
+
+  private val relevant_options =
+    List(
+      "build_system_ssh_host",
+      "build_system_ssh_user",
+      "build_system_ssh_port",
+      "build_system_submission_dir")
+
+  val isabelle_tool1 = Isabelle_Tool("submit_build", "submit build on build system",
+    Scala_Project.here,
+    { args =>
+      var afp_root: Option[Path] = None
+      val base_sessions = new mutable.ListBuffer[String]
+      var presentation = false
+      var requirements = false
+      val exclude_session_groups = new mutable.ListBuffer[String]
+      var all_sessions = false
+      var build_heap = false
+      var clean_build = false
+      var export_files = false
+      var fresh_build = false
+      val session_groups = new mutable.ListBuffer[String]
+      var options = Options.init(specs = Options.Spec.ISABELLE_BUILD_OPTIONS)
+      var prefs: List[Options.Spec] = Nil
+      val exclude_sessions = new mutable.ListBuffer[String]
+
+      def show_options: String =
+        cat_lines(relevant_options.flatMap(options.get).map(_.print))
+
+      val getopts = Getopts("""
+Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
+
+  Options are:
+    -A ROOT      include AFP with given root directory (":" for \"\"\" + AFP.BASE.implode + \"\"\")
+    -B NAME      include session NAME and all descendants
+    -P           enable HTML/PDF presentation
+    -R           refer to requirements of selected sessions
+    -S           soft build: only observe changes of sources, not heap images
+    -X NAME      exclude sessions from group NAME and all descendants
+    -a           select all sessions
+    -b           build heap images
+    -c           clean build
+    -e           export files from session specification into file-system
+    -f           fresh build
+    -g NAME      select session group NAME
+    -k KEYWORD   check theory sources for conflicts with proposed keywords
+    -l           list session source files
+    -n           no build -- take existing session build databases
+    -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
+    -p OPTIONS   comma-separated preferences for build process
+    -v           verbose
+    -x NAME      exclude session NAME and all descendants
+
+  Submit build on SSH server, depending on system options:
+""" + Library.indent_lines(2, show_options) + "\n",
+        "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
+        "B:" -> (arg => base_sessions += arg),
+        "P" -> (_ => presentation = true),
+        "R" -> (_ => requirements = true),
+        "X:" -> (arg => exclude_session_groups += arg),
+        "a" -> (_ => all_sessions = true),
+        "b" -> (_ => build_heap = true),
+        "c" -> (_ => clean_build = true),
+        "e" -> (_ => export_files = true),
+        "f" -> (_ => fresh_build = true),
+        "g:" -> (arg => session_groups += arg),
+        "o:" -> (arg => options = options + arg),
+        "p:" -> (arg => prefs = Options.Spec.parse(arg)),
+        "x:" -> (arg => exclude_sessions += arg))
+
+      val sessions = getopts(args)
+      val store = Store(options)
+      val progress = new Console_Progress()
+
+      submit_build(store = store, afp_root = afp_root, base_sessions = base_sessions.toList,
+        presentation = presentation, requirements = requirements, exclude_session_groups =
+        exclude_session_groups.toList, all_sessions = all_sessions, build_heap = build_heap,
+        clean_build = clean_build, export_files = export_files, fresh_build = fresh_build,
+        session_groups = session_groups.toList, sessions = sessions, prefs = prefs,
+        exclude_sessions = exclude_sessions.toList, progress = progress)
     })
 }
 
