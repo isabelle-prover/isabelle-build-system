@@ -80,7 +80,7 @@ object Build_System {
     afp_version: Option[String],
     start_date: Date = Date.now(),
     estimate: Option[Date] = None,
-  ) extends Library.Named { def name: String = id.toString }
+  ) extends Library.Named { def name: String = kind + "/" + number }
 
   object Status {
     def from_rc(rc: Int): Status = if (rc == 0) ok else failed
@@ -105,7 +105,7 @@ object Build_System {
 
     type Pending = Library.Update.Data[Task]
     type Running = Library.Update.Data[Job]
-    type Finished = Library.Update.Data[Result]
+    type Finished = Map[String, Result]
   }
 
   sealed case class State(
@@ -249,10 +249,12 @@ object Build_System {
           val fresh_build = res.bool(Pending.fresh_build)
           val presentation = res.bool(Pending.presentation)
 
-          id -> Task(kind, UUID.make(id), submit_date, priority, prefs, isabelle_version,
+          val task = Task(kind, UUID.make(id), submit_date, priority, prefs, isabelle_version,
             afp_version, requirements, all_session, base_sessions, exclude_session_groups,
             exclude_sessions, session_groups, sessions, build_heap, clean_build, export_files,
             fresh_build, presentation)
+
+          task.name -> task
         })
 
     def update_pending(
@@ -261,16 +263,17 @@ object Build_System {
       pending: Build_System.State.Pending
     ): Library.Update = {
       val update = Library.Update.make(old_pending, pending)
+      val delete = update.delete.map(old_pending(_).id.toString)
 
       if (update.deletes)
-        db.execute_statement(Pending.table.delete(Pending.id.where_member(update.delete)))
+        db.execute_statement(Pending.table.delete(Pending.id.where_member(delete)))
 
       if (update.inserts) {
         db.execute_batch_statement(Pending.table.insert(), batch =
-          for (id <- update.insert) yield { stmt =>
-            val task = pending(id)
+          for (name <- update.insert) yield { stmt =>
+            val task = pending(name)
             stmt.string(1) = task.kind
-            stmt.string(2) = id
+            stmt.string(2) = task.id.toString
             stmt.date(3) = task.submit_date
             stmt.string(4) = task.priority.toString
             stmt.string(5) = Options.Spec.bash_strings(task.prefs)
@@ -325,8 +328,10 @@ object Build_System {
           val start_date = res.date(Running.start_date)
           val estimate = res.get_date(Running.estimate)
 
-          id -> Job(UUID.make(id), kind, number, prefs, isabelle_version,
+          val job = Job(UUID.make(id), kind, number, prefs, isabelle_version,
             afp_version, start_date, estimate)
+
+          job.name -> job
         })
 
     def update_running(
@@ -335,14 +340,16 @@ object Build_System {
       running: Build_System.State.Running
     ): Library.Update = {
       val update = Library.Update.make(old_running, running)
+      val delete = update.delete.map(old_running(_).id.toString)
 
       if (update.deletes)
-        db.execute_statement(Running.table.delete(Running.id.where_member(update.delete)))
+        db.execute_statement(Running.table.delete(Running.id.where_member(delete)))
+
       if (update.inserts) {
         db.execute_batch_statement(Running.table.insert(), batch =
-          for (id <- update.insert) yield { stmt =>
-            val job = running(id)
-            stmt.string(1) = id
+          for (name <- update.insert) yield { stmt =>
+            val job = running(name)
+            stmt.string(1) = job.id.toString
             stmt.string(2) = job.kind
             stmt.long(3) = job.number
             stmt.string(4) = Options.Spec.bash_strings(job.prefs)
@@ -390,7 +397,8 @@ object Build_System {
           val date = res.date(Finished.date)
           val serial = res.long(Finished.serial)
 
-          serial.toString -> Result(kind, number, status, date, serial)
+          val result = Result(kind, number, status, date, serial)
+          result.name -> result
         }
       )
     }
@@ -544,7 +552,7 @@ object Build_System {
     }
 
     def init: Unit = ()
-    def iterate(a: Unit): Unit = {
+    def iterate(u: Unit): Unit = {
       start_next() match {
         case Some((job, build_context)) =>
           echo("Running job " + job.id)
