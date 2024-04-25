@@ -571,8 +571,9 @@ object Build_System {
     def task =
       Task(kind, priority = Priority.low, afp_version = Some(Version.Latest), all_sessions = true,
         exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
+
     private def add_task(): Unit = synchronized_database("Poller.add_task") {
-      if (_state.pending.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
+      if (!_state.pending.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
     }
 
     def iterate(ids: (String, String)): (String, String) =
