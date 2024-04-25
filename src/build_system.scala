@@ -499,6 +499,9 @@ object Build_System {
     def echo_error_message(msg: String) = progress.echo_error_message(name + ": " + msg)
   }
 
+
+  /* build runner */
+
   class Runner(
     store: Store,
     isabelle_repository: Mercurial.Repository,
@@ -522,43 +525,42 @@ object Build_System {
       }
     }
 
-    private def start_next(): Option[(Job, Build_Context)] =
+    private def start_next(): Option[(Task, Job)] =
       synchronized_database("start_job") {
         _state.next.headOption.flatMap { task =>
           echo("Initializing task " + task.id)
-          val build_context = Build_Context.make(store, task)
+          val context = Context(store, task)
           val number = _state.next_number(task.kind)
 
           Exn.capture {
             val isabelle_version =
-              sync(isabelle_repository, task.isabelle_version, build_context.isabelle_dir)
-            val afp_version = task.afp_version.map(sync(afp_repository, _, build_context.afp_dir))
+              sync(isabelle_repository, task.isabelle_version, context.isabelle_dir)
+            val afp_version = task.afp_version.map(sync(afp_repository, _, context.afp_dir))
 
             Job(task.id, task.kind, number, task.prefs, isabelle_version, afp_version)
           } match {
             case Exn.Res(job) =>
               _state = _state.add_running(job)
-              build_context.progress.echo("Started " + job.name)
-              Some(job, build_context)
+              val context1 = context.move(Context(store, job))
+              context1.progress.echo("Starting " + job.name)
+
+              Some(task, job)
             case Exn.Exn(exn) =>
               val msg = "Failed to start job: " + exn.getMessage
               echo_error_message(msg)
-              build_context.progress.echo_error_message(msg)
 
               val result = Result(task.kind, number, Status.aborted)
-              store_log(build_context, result)
+              val context1 = Context(store, result)
+              context1.progress.echo_error_message(msg)
+
+              context.remove()
               _state = _state
                 .remove_pending(task.name)
                 .add_finished(result)
+
               None
           }
         }
-    }
-
-    private def store_log(build_context: Build_Context, result: Result): Unit = {
-      val result_context = Result_Context.make(store, result)
-      Isabelle_System.copy_file(build_context.log_file, result_context.log_file)
-      Isabelle_System.rm_tree(build_context.dir)
     }
 
     private def finish_job(job: Job, result: Result): Unit = {
@@ -573,19 +575,24 @@ object Build_System {
     def init: Unit = ()
     def iterate(u: Unit): Unit = {
       start_next() match {
-        case Some((job, build_context)) =>
+        case Some((task, job)) =>
           echo("Running job " + job.id)
+          val context = Context(store, job)
+          val process_result = context.run(task)
 
-          val process_result = build_context.run()
           val result = Result(job.kind, job.number, Status.from_rc(process_result.rc))
-          store_log(build_context, result)
-          finish_job(job, result)
+          context.copy_results(Context(store, result))
 
+          finish_job(job, result)
+          context.remove()
           echo("Finished job " + job.id + " with status code " + process_result.rc)
         case None =>
       }
     }
   }
+
+
+  /* repository poller */
 
   class Poller(
     store: Store,
@@ -625,6 +632,9 @@ object Build_System {
       }
   }
 
+
+  /* submission process */
+
   class Submitter(task: Task, store: Store, progress: Progress)
     extends Process("Submitter", store) {
 
@@ -634,6 +644,9 @@ object Build_System {
     }
     override def run(): Future[Unit] = Future.fork { add_task() }
   }
+
+
+  /* web server */
 
   object Page {
     val HOME = Path.basic("home")
@@ -721,17 +734,15 @@ object Build_System {
 
       def render_build(name: String, state: State): XML.Body = {
         def render_job(job: Job): XML.Body = {
-          val log = File.read(Build_Context.init(store, state.pending(job.id.toString)).log_file)
           par(text("Start: " + job.start_date)) ::
           par(text("Running...")) ::
-          source(log) :: Nil
+          source(Context(store, job).log) :: Nil
         }
 
         def render_result(result: Result): XML.Body = {
-          val log = File.read(Result_Context.init(store, result).log_file)
           par(text("Date: " + result.date)) ::
           par(text("Status: " + result.status)) ::
-          source(log) :: Nil
+          source(Context(store, result).log) :: Nil
         }
 
         chapter(name) ::
@@ -783,51 +794,54 @@ object Build_System {
   }
 
 
-  /* contexts */
+  /* context */
 
-  object Build_Context {
-    def init(store: Store, task: Task): Build_Context = new Build_Context(store, task)
-    def make(store: Store, task: Task): Build_Context = {
-      val build_context = init(store, task)
-      Isabelle_System.make_directory(build_context.dir)
-      build_context
-    }
+  object Context {
+    def apply(store: Store, task: Task): Context =
+      new Context(store, store.dir(task), task.afp_version.isDefined)
+
+    def apply(store: Store, job: Job): Context =
+      new Context(store, store.dir(job), job.afp_version.isDefined)
+
+    def apply(store: Store, result: Result): Context = new Context(store, store.dir(result))
   }
 
-  class Build_Context private(store: Store, val task: Task) {
-    val dir = store.build_dir + Path.basic(task.id.toString)
-
-    val isabelle_dir: Path = dir + Path.basic("isabelle")
+  class Context private(store: Store, val dir: Path, val afp: Boolean = false) {
+    def isabelle_dir: Path = dir + Path.basic("isabelle")
     def afp_dir: Path = isabelle_dir + Path.basic("AFP")
-    def afp_path: Option[Path] = if (task.afp_version.isDefined) Some(afp_dir) else None
+    def afp_path: Option[Path] = if (afp) Some(afp_dir) else None
 
-    val log_file: Path = dir + Path.basic("log")
+    private val log_file = dir + Path.basic("log")
     val progress = new File_Progress(log_file, verbose = true)
+    def log: String =
+      Exn.capture(File.read(log_file)) match {
+        case Exn.Exn(_) => ""
+        case Exn.Res(res) => res
+      }
+
+    def move(other: Context): Context = {
+      Isabelle_System.make_directory(other.dir.dir)
+      Isabelle_System.move_file(dir, other.dir)
+      other
+    }
+
+    def copy_results(other: Context): Context = {
+      Isabelle_System.make_directory(other.dir)
+      Isabelle_System.copy_file(log_file, other.log_file)
+      other
+    }
+
+    def remove(): Unit = Isabelle_System.rm_tree(dir)
 
     def isabelle =
       Other_Isabelle(isabelle_dir, store.build_system_identifier, store.open_ssh(), progress)
 
-    def run(): Process_Result = {
+    def run(task: Task): Process_Result = {
       isabelle.init(fresh = task.fresh_build, echo = true)
       val cmd = task.build_command(isabelle_dir, afp_path)
       progress.echo(cmd)
       isabelle.bash(cmd, echo = true)
     }
-  }
-
-  object Result_Context {
-    def init(store: Store, result: Result): Result_Context = new Result_Context(store, result)
-    def make(store: Store, result: Result): Result_Context = {
-      val result_context = init(store, result)
-      Isabelle_System.make_directory(result_context.dir)
-      result_context
-    }
-  }
-
-  class Result_Context private(store: Store, val result: Result) {
-    val dir: Path = store.finished_dir + Path.make(List(result.kind, result.number.toString))
-
-    def log_file: Path = dir + Path.basic("log")
   }
 
 
@@ -837,8 +851,10 @@ object Build_System {
     val base_dir = Path.explode(options.string("build_system_submission_dir"))
     val build_system_identifier = options.string("build_system_identifier")
 
-    val build_dir = base_dir + Path.basic("build")
-    val finished_dir = base_dir + Path.basic("finished")
+    def dir(task: Task): Path = base_dir + Path.make(List("pending", task.id.toString))
+    def dir(job: Job): Path = base_dir + Path.make(List("running", job.kind, job.number.toString))
+    def dir(result: Result): Path =
+      base_dir + Path.make(List("finished", result.kind, result.number.toString))
 
     def open_ssh(): SSH.System =
       SSH.open_system(options,
@@ -903,16 +919,16 @@ object Build_System {
       requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
       session_groups, sessions, build_heap, clean_build, export_files, fresh_build, presentation)
 
-    val build_context = Build_Context.make(store, task)
+    val context = Context(store, task)
 
     progress.interrupt_handler {
       using(store.open_ssh()) { ssh =>
         val rsync_context = Rsync.Context(ssh = ssh)
         progress.echo("Transferring repositories...")
-        Sync.sync(store.options, rsync_context, build_context.isabelle_dir, afp_root = afp_root)
+        Sync.sync(store.options, rsync_context, context.isabelle_dir, afp_root = afp_root)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
-          ssh.delete(build_context.dir)
+          ssh.delete(context.dir)
         } else {
           val submitter = new Submitter(task, store, progress)
           submitter.run().join
