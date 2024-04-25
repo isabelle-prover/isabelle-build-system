@@ -119,11 +119,18 @@ object Build_System {
     def add_pending(task: Task): State = copy(pending = pending + (task.name -> task))
     def remove_pending(name: String): State = copy(pending = pending - name)
 
-    def next_pending: List[Task] =
-      if (pending.isEmpty) Nil
+    def waiting: State.Pending = {
+      val running_ids = running.values.map(_.id).toSet
+      pending.filterNot((_, task) => running_ids.contains(task.id))
+    }
+
+    def size = waiting.size + running.size + finished.size
+
+    def next: List[Task] =
+      if (waiting.isEmpty) Nil
       else {
-        val priority = pending.values.map(_.priority).maxBy(_.ordinal)
-        pending.values.filter(_.priority == priority).toList.sortBy(_.submit_date)(Date.Ordering)
+        val priority = waiting.values.map(_.priority).maxBy(_.ordinal)
+        waiting.values.filter(_.priority == priority).toList.sortBy(_.submit_date)(Date.Ordering)
       }
 
     def add_running(job: Job): State = copy(running = running + (job.name -> job))
@@ -131,12 +138,20 @@ object Build_System {
 
     def add_finished(result: Result): State = copy(finished = finished + (result.name -> result))
 
+    lazy val kinds = (
+      pending.values.map(_.kind) ++
+      running.values.map(_.kind) ++
+      finished.values.map(_.kind)).toList.distinct
+
     def next_number(kind: String): Long = {
-      val serials =
-        (for ((_, result) <- finished if result.kind == kind) yield result.number) ++
-        (for ((_, job) <- running if job.kind == kind) yield job.number)
+      val serials = get_finished(kind).map(_.number) ::: get_running(kind).map(_.number)
       State.inc_serial(State.max_serial(serials))
     }
+
+    def get_running(kind: String): List[Job] =
+      (for ((_, job) <- running if job.kind == kind) yield job).toList
+    def get_finished(kind: String): List[Result] =
+      (for ((_, result) <- finished if result.kind == kind) yield result).toList
   }
 
 
@@ -509,9 +524,8 @@ object Build_System {
 
     private def start_next(): Option[(Job, Build_Context)] =
       synchronized_database("start_job") {
-        _state.next_pending.headOption.flatMap { task =>
+        _state.next.headOption.flatMap { task =>
           echo("Initializing task " + task.id)
-          _state = _state.remove_pending(task.name)
           val build_context = Build_Context.make(store, task)
           val number = _state.next_number(task.kind)
 
@@ -524,6 +538,7 @@ object Build_System {
           } match {
             case Exn.Res(job) =>
               _state = _state.add_running(job)
+              build_context.progress.echo("Started " + job.name)
               Some(job, build_context)
             case Exn.Exn(exn) =>
               val msg = "Failed to start job: " + exn.getMessage
@@ -532,7 +547,9 @@ object Build_System {
 
               val result = Result(task.kind, number, Status.aborted)
               store_log(build_context, result)
-              _state = _state.add_finished(result)
+              _state = _state
+                .remove_pending(task.name)
+                .add_finished(result)
               None
           }
         }
@@ -546,8 +563,10 @@ object Build_System {
 
     private def finish_job(job: Job, result: Result): Unit = {
       synchronized_database("finish_job") {
-        _state = _state.remove_running(job.name)
-        _state = _state.add_finished(result)
+        _state = _state
+          .remove_pending(job.id.toString)
+          .remove_running(job.name)
+          .add_finished(result)
       }
     }
 
@@ -585,7 +604,7 @@ object Build_System {
         exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
 
     private def add_task(): Unit = synchronized_database("add_task") {
-      if (!_state.pending.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
+      if (!_state.waiting.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
     }
 
     def iterate(ids: (String, String)): (String, String) =
@@ -616,12 +635,160 @@ object Build_System {
     override def run(): Future[Unit] = Future.fork { add_task() }
   }
 
+  object Page {
+    val HOME = Path.basic("home")
+    val OVERVIEW = Path.basic("overview")
+    val BUILD = Path.basic("build")
+  }
+
+  class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
+    extends Loop_Process[Unit]("Web_Server", store, progress) {
+
+    enum Model {
+      case Error extends Model
+      case Home(state: State) extends Model
+      case Overview(kind: String, state: State) extends Model
+      case Build(name: String, state: State) extends Model
+    }
+
+    object View {
+      import HTML.*
+      import Web_App.More_HTML.*
+
+      def render_if(cond: Boolean, body: XML.Body): XML.Body = if (cond) body else Nil
+      def render_link(name: String, number: Long): XML.Elem =
+        link(
+          paths.frontend_url(Page.BUILD, Markup.Name(name)).toString,
+          text("#" + number)) + ("target" -> "_parent")
+
+      def render_home(state: State): XML.Body = {
+        def render_kind(kind: String): XML.Elem = {
+          val running = state.get_running(kind).sortBy(_.number).reverse
+          val finished = state.get_finished(kind).sortBy(_.number).reverse
+
+          def render_previous(finished: List[Result]): XML.Body = {
+            val (failed, rest) = finished.span(_.status != Status.ok)
+            val first_failed = failed.lastOption.map(result =>
+              par(
+                text("first failure: ") :::
+                render_link(result.name, result.number) ::
+                text("on " + result.date)))
+            val last_success = rest.headOption.map(result =>
+              par(
+                text("last success: ") ::: render_link(result.name, result.number) ::
+                text("on " + result.date)))
+            first_failed.toList ::: last_success.toList
+          }
+
+          def render_job(job: Job): XML.Body =
+            par(render_link(job.name, job.number) :: text(": running since " + job.start_date)) ::
+            render_if(finished.headOption.exists(_.status != Status.ok), render_previous(finished))
+
+          def render_result(result: Result): XML.Body =
+            par(
+              render_link(result.name, result.number) ::
+              text(" (" + result.status.toString + ") on " + result.date)) ::
+            render_if(result.status != Status.ok, render_previous(finished.tail))
+
+          fieldset(
+            XML.elem("legend", List(
+              link(paths.frontend_url(Page.OVERVIEW, Markup.Kind(kind)).toString, text(kind)))) ::
+            (if (running.nonEmpty) render_job(running.head)
+            else if (finished.nonEmpty) render_result(finished.head)
+            else Nil))
+        }
+
+        chapter("Dashboard") ::
+          text("Queue: " + state.waiting.size + " tasks waiting") :::
+          section("Builds") :: text("Total: " + state.size + " builds") :::
+          state.kinds.map(render_kind)
+      }
+
+      def render_overview(kind: String, state: State): XML.Body = {
+        def render_job(job: Job): XML.Body =
+          List(par(render_link(job.name, job.number) :: text(" running since " + job.start_date)))
+
+        def render_result(result: Result): XML.Body =
+          List(par(
+            render_link(result.name, result.number) ::
+            text(" (" + result.status + ") on " + result.date)))
+
+        chapter(kind) ::
+          itemize(
+            state.get_running(kind).sortBy(_.number).reverse.map(render_job) :::
+            state.get_finished(kind).sortBy(_.number).reverse.map(render_result)) :: Nil
+      }
+
+      def render_build(name: String, state: State): XML.Body = {
+        def render_job(job: Job): XML.Body = {
+          val log = File.read(Build_Context.init(store, state.pending(job.id.toString)).log_file)
+          par(text("Start: " + job.start_date)) ::
+          par(text("Running...")) ::
+          source(log) :: Nil
+        }
+
+        def render_result(result: Result): XML.Body = {
+          val log = File.read(Result_Context.init(store, result).log_file)
+          par(text("Date: " + result.date)) ::
+          par(text("Status: " + result.status)) ::
+          source(log) :: Nil
+        }
+
+        chapter(name) ::
+          state.running.get(name).map(render_job).orElse(
+          state.finished.get(name).map(render_result)).getOrElse(
+          text("Not found"))
+      }
+    }
+
+    private val server = new Web_App.Server[Model](paths, port, progress = progress) {
+      /* control */
+
+      def overview: Some[Model.Home] = Some(Model.Home(_state))
+
+      def get_overview(props: Properties.T): Option[Model.Overview] =
+        props match {
+          case Markup.Kind(kind) => Some(Model.Overview(kind, _state))
+          case _ => None
+        }
+
+      def get_build(props: Properties.T): Option[Model.Build] =
+        props match {
+          case Markup.Name(name) => Some(Model.Build(name, _state))
+          case _ => None
+        }
+
+      def render(model: Model): XML.Body =
+        HTML.title("Isabelle Build System") :: (
+          model match {
+            case Model.Error => HTML.text("invalid request")
+            case Model.Home(state) => View.render_home(state)
+            case Model.Overview(kind, state) => View.render_overview(kind, state)
+            case Model.Build(name, state) => View.render_build(name, state)
+          })
+
+      val error_model: Model = Model.Error
+      val endpoints = List(
+        Get(Page.HOME, "home", _ => overview),
+        Get(Page.OVERVIEW, "overview", get_overview),
+        Get(Page.BUILD, "build", get_build))
+      val head = Nil
+    }
+
+    def init: Unit = server.start()
+    def iterate(u: Unit): Unit = {
+      if (progress.stopped) server.stop()
+      else synchronized_database("server") { }
+    }
+  }
+
 
   /* contexts */
 
   object Build_Context {
+    def init(store: Store, task: Task): Build_Context = new Build_Context(store, task)
     def make(store: Store, task: Task): Build_Context = {
-      val build_context = new Build_Context(store, task)
+      val build_context = init(store, task)
       Isabelle_System.make_directory(build_context.dir)
       build_context
     }
@@ -649,8 +816,9 @@ object Build_System {
   }
 
   object Result_Context {
+    def init(store: Store, result: Result): Result_Context = new Result_Context(store, result)
     def make(store: Store, result: Result): Result_Context = {
-      val result_context = new Result_Context(store, result)
+      val result_context = init(store, result)
       Isabelle_System.make_directory(result_context.dir)
       result_context
     }
@@ -693,15 +861,20 @@ object Build_System {
   def build_system(
     afp_root: Option[Path],
     options: Options,
+    port: Int,
+    frontend: String,
     progress: Progress = new Progress
   ): Unit = {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
     val afp_repository = Mercurial.repository(afp_root.getOrElse(AFP.BASE))
 
+    val paths = Web_App.Paths(Url(frontend + ":" + port), Path.current, true, Page.HOME)
+
     val processes = List(
       new Runner(store, isabelle_repository, afp_repository, progress),
-      new Poller(store, isabelle_repository, afp_repository, progress))
+      new Poller(store, isabelle_repository, afp_repository, progress),
+      new Web_Server(port, paths, store, progress))
     progress.interrupt_handler(processes.map(_.run()).map(_.join))
   }
 
@@ -756,26 +929,33 @@ object Build_System {
   val isabelle_tool = Isabelle_Tool("build_system", "run build system", Scala_Project.here,
     { args =>
       var afp_root: Option[Path] = None
+      var frontend = "http://localhost"
       var options = Options.init()
+      var port = 8080
 
       val getopts = Getopts("""
 Usage: isabelle build_system [OPTIONS]
 
   Options are:
     -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
+    -b URL       application frontend url. Default: """ + frontend + """
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
+    -p PORT      explicit web server port
 
   Run Isabelle build system and server frontend.
 """,
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
-        "o:" -> (arg => options = options + arg))
+        "b:" -> (arg => frontend = arg),
+        "o:" -> (arg => options = options + arg),
+        "p:" -> (arg => port = Value.Int.parse(arg)))
 
       val more_args = getopts(args)
       if (more_args.nonEmpty) getopts.usage()
 
       val progress = new Console_Progress()
 
-      build_system(afp_root = afp_root, options = options, progress = progress)
+      build_system(afp_root = afp_root, options = options, port = port, frontend = frontend,
+        progress = progress)
     })
 
   private val relevant_options =
