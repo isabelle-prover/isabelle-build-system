@@ -131,8 +131,13 @@ object Build_System {
     def remove_running(name: String): State = copy(running = running - name)
 
     def add_finished(result: Result): State = copy(finished = finished + (result.name -> result))
-    def num_finished(kind: String): Long =
-      State.max_serial(for ((_, result) <- finished if result.kind == kind) yield result.number)
+
+    def next_number(kind: String): Long = {
+      val serials =
+        (for ((_, result) <- finished if result.kind == kind) yield result.number) ++
+        (for ((_, job) <- running if job.kind == kind) yield job.number)
+      State.inc_serial(State.max_serial(serials))
+    }
   }
 
 
@@ -496,7 +501,7 @@ object Build_System {
         progress.echo("Initializing task " + task.id)
         _state = _state.remove_pending(task.name)
         val context = Build_Context.make(store, task)
-        val number = State.inc_serial(_state.num_finished(task.kind))
+        val number = _state.next_number(task.kind)
 
         Exn.capture {
           val isabelle_version =
@@ -525,12 +530,13 @@ object Build_System {
       }
     }
 
-    private def finish_job(job: Job, result: Process_Result): Unit =
+    private def finish_job(job: Job, result: Process_Result): Unit = {
       synchronized_database("Runner.finish_job") {
         progress.echo("Finished job " + job.id + " with status code " + result.rc)
         _state = _state.remove_running(job.name)
         _state = _state.add_finished(Result(job.kind, job.number, Status.from_rc(result.rc)))
       }
+    }
 
     def init: Unit = ()
     def iterate(a: Unit): Unit = {
