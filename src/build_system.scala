@@ -434,7 +434,8 @@ object Build_System {
     protected var _state = State()
 
     protected def synchronized_database[A](label: String)(body: => A): A = synchronized {
-      Build_System.private_data.transaction_lock(_database, create = true, label = label) {
+      Build_System.private_data.transaction_lock(_database, create = true,
+        label = name + "." + label) {
         val old_state = Build_System.private_data.pull_state(_database, _state)
         _state = old_state
         val res = body
@@ -470,6 +471,9 @@ object Build_System {
       close()
       progress.echo("Stopped " + name)
     }
+
+    def echo(msg: String) = progress.echo(name + ": "+ msg)
+    def echo_error_message(msg: String) = progress.echo_error_message(name + ": " + msg)
   }
 
   class Runner(
@@ -496,9 +500,9 @@ object Build_System {
     }
 
     private def start_next(): Option[(Job, Build_Context)] =
-      synchronized_database("Runner.start_job") {
+      synchronized_database("start_job") {
         _state.next_pending.headOption.flatMap { task =>
-          progress.echo("Initializing task " + task.id)
+          echo("Initializing task " + task.id)
           _state = _state.remove_pending(task.name)
           val build_context = Build_Context.make(store, task)
           val number = _state.next_number(task.kind)
@@ -515,7 +519,7 @@ object Build_System {
               Some(job, build_context)
             case Exn.Exn(exn) =>
               val msg = "Failed to start job: " + exn.getMessage
-              progress.echo_error_message(msg)
+              echo_error_message(msg)
               build_context.progress.echo_error_message(msg)
 
               val result = Result(task.kind, number, Status.aborted)
@@ -533,7 +537,7 @@ object Build_System {
     }
 
     private def finish_job(job: Job, result: Result): Unit = {
-      synchronized_database("Runner.finish_job") {
+      synchronized_database("finish_job") {
         _state = _state.remove_running(job.name)
         _state = _state.add_finished(result)
       }
@@ -543,14 +547,14 @@ object Build_System {
     def iterate(a: Unit): Unit = {
       start_next() match {
         case Some((job, build_context)) =>
-          progress.echo("Running job " + job.id)
+          echo("Running job " + job.id)
 
           val process_result = build_context.run()
           val result = Result(job.kind, job.number, Status.from_rc(process_result.rc))
           store_log(build_context, result)
           finish_job(job, result)
 
-          progress.echo("Finished job " + job.id + " with status code " + process_result.rc)
+          echo("Finished job " + job.id + " with status code " + process_result.rc)
         case None =>
       }
     }
@@ -572,7 +576,7 @@ object Build_System {
       Task(kind, priority = Priority.low, afp_version = Some(Version.Latest), all_sessions = true,
         exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
 
-    private def add_task(): Unit = synchronized_database("Poller.add_task") {
+    private def add_task(): Unit = synchronized_database("add_task") {
       if (!_state.pending.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
     }
 
@@ -583,11 +587,11 @@ object Build_System {
         (isabelle_repository.id(), afp_repository.id())
       } match {
         case Exn.Exn(exn) =>
-          progress.echo_error_message("Could not reach repository: " + exn.getMessage)
+          echo_error_message("Could not reach repository: " + exn.getMessage)
           ids
         case Exn.Res(ids1) =>
           if (ids != ids1) {
-            progress.echo("Found new revisions: " + ids1)
+            echo("Found new revisions: " + ids1)
             add_task()
           }
           ids1
@@ -597,7 +601,7 @@ object Build_System {
   class Submitter(task: Task, store: Store, progress: Progress)
     extends Process("Submitter", store) {
 
-    private def add_task(): Unit = synchronized_database("Submitter.add_task") {
+    private def add_task(): Unit = synchronized_database("add_task") {
       progress.echo("Submitting task " + task.id)
       _state = _state.add_pending(task)
     }
