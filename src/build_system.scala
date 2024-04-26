@@ -445,7 +445,7 @@ object Build_System {
 
   /* active processes: runner, poller */
 
-  abstract class Process(name: String, store: Store) {
+  abstract class Process(name: String, store: Store) extends Runnable {
     val options = store.options
 
     private val _database =
@@ -466,8 +466,6 @@ object Build_System {
         res
       }
     }
-
-    def run(): Future[Unit]
   }
 
   abstract class Loop_Process[A](name: String, store: Store, progress: Progress)
@@ -477,18 +475,21 @@ object Build_System {
     def init: A
     def iterate(a: A): A
 
+    def sleep(time: Time): Unit = synchronized { wait(time.ms) }
+    def stop(): Unit = synchronized { notify() }
+
     @tailrec private def loop(a: A): Unit =
       if (!progress.stopped) {
         val start = Date.now()
         val a1 = iterate(a)
         if (!progress.stopped) {
           val elapsed = Date.now() - start
-          if (elapsed < delay) (delay - elapsed).sleep()
+          if (elapsed < delay) sleep(delay - elapsed)
           loop(a1)
         }
       }
 
-    override def run(): Future[Unit] = Future.thread(name) {
+    override def run(): Unit = {
       progress.echo("Started " + name)
       loop(init)
       close()
@@ -642,7 +643,7 @@ object Build_System {
       progress.echo("Submitting task " + task.id)
       _state = _state.add_pending(task)
     }
-    override def run(): Future[Unit] = Future.fork { add_task() }
+    override def run(): Unit = add_task()
   }
 
 
@@ -891,7 +892,15 @@ object Build_System {
       new Runner(store, isabelle_repository, afp_repository, progress),
       new Poller(store, isabelle_repository, afp_repository, progress),
       new Web_Server(port, paths, store, progress))
-    progress.interrupt_handler(processes.map(_.run()).map(_.join))
+
+    val threads = processes.map(new Thread(_))
+    POSIX_Interrupt.handler {
+      progress.stop()
+      processes.foreach(_.stop())
+    } {
+      threads.foreach(_.start())
+      threads.foreach(_.join())
+    }
   }
 
   def submit_build(
@@ -931,7 +940,7 @@ object Build_System {
           ssh.delete(context.dir)
         } else {
           val submitter = new Submitter(task, store, progress)
-          submitter.run().join
+          submitter.run()
         }
       }
     }
