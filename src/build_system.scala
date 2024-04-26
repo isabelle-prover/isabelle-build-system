@@ -750,6 +750,10 @@ object Build_System {
     val BUILD_CANCEL = Path.explode("build/cancel")
   }
 
+  object API {
+    val CSS = Path.explode("api/isabelle.css")
+  }
+
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
     extends Loop_Process[Unit]("Web_Server", store, progress) {
 
@@ -904,8 +908,9 @@ object Build_System {
         Get(Page.HOME, "home", _ => overview),
         Get(Page.OVERVIEW, "overview", get_overview),
         Get(Page.BUILD, "build", get_build),
-        Get(Page.BUILD_CANCEL, "cancel build", cancel_build))
-      val head = Nil
+        Get(Page.BUILD_CANCEL, "cancel build", cancel_build),
+        Get_File(API.CSS, "css", _ => Some(HTML.isabelle_css)))
+      val head = List(HTML.style_file(paths.api_route(API.CSS)))
     }
 
     def init: Unit = server.start()
