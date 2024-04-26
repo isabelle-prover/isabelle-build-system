@@ -80,10 +80,15 @@ object Build_System {
     afp_version: Option[String],
     start_date: Date = Date.now(),
     estimate: Option[Date] = None,
+    cancelled: Boolean = false
   ) extends Library.Named { def name: String = kind + "/" + number }
 
   object Status {
-    def from_rc(rc: Int): Status = if (rc == 0) ok else failed
+    def from_result(result: Process_Result): Status = {
+      if (result.ok) Status.ok
+      else if (result.interrupted) Status.cancelled
+      else Status.failed
+    }
   }
 
   enum Status { case ok, cancelled, aborted, failed  }
@@ -324,10 +329,11 @@ object Build_System {
       val afp_version = SQL.Column.string("afp_option")
       val start_date = SQL.Column.date("start_date")
       val estimate = SQL.Column.date("estimate")
+      val cancelled = SQL.Column.bool("cancelled")
 
       val table =
         make_table(List(id, kind, number, prefs, isabelle_version,
-          afp_version, start_date, estimate),
+          afp_version, start_date, estimate, cancelled),
         name = "running")
     }
 
@@ -342,9 +348,10 @@ object Build_System {
           val afp_version = res.get_string(Running.afp_version)
           val start_date = res.date(Running.start_date)
           val estimate = res.get_date(Running.estimate)
+          val cancelled = res.bool(Running.cancelled)
 
           val job = Job(UUID.make(id), kind, number, prefs, isabelle_version,
-            afp_version, start_date, estimate)
+            afp_version, start_date, estimate, cancelled)
 
           job.name -> job
         })
@@ -372,6 +379,7 @@ object Build_System {
             stmt.string(6) = job.afp_version
             stmt.date(7) = job.start_date
             stmt.date(8) = job.estimate
+            stmt.bool(9) = job.cancelled
           })
       }
       update
@@ -474,15 +482,16 @@ object Build_System {
 
     def init: A
     def iterate(a: A): A
+    def stopped(a: A): Boolean = progress.stopped
 
     def sleep(time: Time): Unit = synchronized { wait(time.ms) }
     def stop(): Unit = synchronized { notify() }
 
     @tailrec private def loop(a: A): Unit =
-      if (!progress.stopped) {
+      if (!stopped(a)) {
         val start = Date.now()
         val a1 = iterate(a)
-        if (!progress.stopped) {
+        if (!stopped(a)) {
           val elapsed = Date.now() - start
           if (elapsed < delay) sleep(delay - elapsed)
           loop(a1)
@@ -503,12 +512,57 @@ object Build_System {
 
   /* build runner */
 
+  object Runner {
+    object State {
+      def empty: State = new State(Map.empty, Map.empty)
+    }
+
+    class State private(
+      processes: Map[String, Future[Bash.Process]],
+      results: Map[String, Future[Process_Result]]
+    ) {
+      def is_empty = processes.isEmpty && results.isEmpty
+
+      def init(task: Task, job: Job, context: Context): State = {
+        val process = Future.fork(context.process(task))
+        val result =
+          Future.fork(Exn.capture(process.join) match {
+            case Exn.Res(res) => context.run(res)
+            case Exn.Exn(_) => Process_Result(Process_Result.RC.interrupt)
+          })
+        new State(processes + (job.name -> process), results + (job.name -> result))
+      }
+
+      def running: List[String] = processes.keys.toList
+
+      def update: (State, Map[String, Process_Result]) = {
+        val finished =
+          for ((name, future) <- results if future.is_finished) yield name -> future.join
+
+        val processes1 = processes.filterNot((name, _) => finished.contains(name))
+        val results1 = results.filterNot((name, _) => finished.contains(name))
+
+        (new State(processes1, results1), finished)
+      }
+
+      def cancel(cancelled: List[String]): State = {
+        for (name <- cancelled) {
+          val process = processes(name)
+          if (process.is_finished) process.join.interrupt()
+          else process.cancel()
+        }
+
+        new State(processes.filterNot(cancelled.contains), results)
+      }
+    }
+  }
+
   class Runner(
     store: Store,
     isabelle_repository: Mercurial.Repository,
     afp_repository: Mercurial.Repository,
     progress: Progress
-  ) extends Loop_Process[Unit]("Runner", store, progress) {
+  ) extends Loop_Process[Runner.State]("Runner", store, progress) {
     val rsync_context = Rsync.Context()
 
     private def sync(repository: Mercurial.Repository, version: Version, target: Path): String = {
@@ -529,7 +583,7 @@ object Build_System {
     private def start_next(): Option[(Task, Job)] =
       synchronized_database("start_job") {
         _state.next.headOption.flatMap { task =>
-          echo("Initializing task " + task.id)
+          echo("Initializing " + task.id)
           val context = Context(store, task)
           val number = _state.next_number(task.kind)
 
@@ -543,15 +597,18 @@ object Build_System {
             case Exn.Res(job) =>
               _state = _state.add_running(job)
               val context1 = context.move(Context(store, job))
-              context1.progress.echo("Starting " + job.name)
+
+              val msg = "Starting " + job.name
+              echo(msg)
+              context1.progress.echo(msg)
 
               Some(task, job)
             case Exn.Exn(exn) =>
-              val msg = "Failed to start job: " + exn.getMessage
-              echo_error_message(msg)
-
               val result = Result(task.kind, number, Status.aborted)
               val context1 = Context(store, result)
+
+              val msg = "Failed to start job: " + exn.getMessage
+              echo_error_message(msg)
               context1.progress.echo_error_message(msg)
 
               context.remove()
@@ -564,30 +621,42 @@ object Build_System {
         }
     }
 
-    private def finish_job(job: Job, result: Result): Unit = {
+    private def stop_cancelled(state: Runner.State): Runner.State =
+      synchronized_database("stop_cancelled") {
+        val cancelled = for (name <- state.running if _state.running(name).cancelled) yield name
+        state.cancel(cancelled)
+      }
+
+    private def finish_job(name: String, process_result: Process_Result): Unit =
       synchronized_database("finish_job") {
+        val job = _state.running(name)
+        val context = Context(store, job)
+
+        val result = Result(job.kind, job.number, Status.from_result(process_result))
+        context.copy_results(Context(store, result))
+        context.remove()
+        echo("Finished job " + job.id + " with status code " + process_result.rc)
+
         _state = _state
           .remove_pending(job.id.toString)
           .remove_running(job.name)
           .add_finished(result)
-      }
     }
 
-    def init: Unit = ()
-    def iterate(u: Unit): Unit = {
-      start_next() match {
-        case Some((task, job)) =>
-          echo("Running job " + job.id)
-          val context = Context(store, job)
-          val process_result = context.run(task)
+    override def stopped(state: Runner.State): Boolean = progress.stopped && state.is_empty
 
-          val result = Result(job.kind, job.number, Status.from_rc(process_result.rc))
-          context.copy_results(Context(store, result))
-
-          finish_job(job, result)
-          context.remove()
-          echo("Finished job " + job.id + " with status code " + process_result.rc)
-        case None =>
+    def init: Runner.State = Runner.State.empty
+    def iterate(state: Runner.State): Runner.State = {
+      if (state.is_empty && !progress.stopped) {
+        start_next() match {
+          case None => state
+          case Some((task, job)) => state.init(task, job, Context(store, job))
+        }
+      }
+      else {
+        val (state1, results) = stop_cancelled(state).update
+        results.foreach(finish_job)
+        state1
       }
     }
   }
@@ -653,6 +722,7 @@ object Build_System {
     val HOME = Path.basic("home")
     val OVERVIEW = Path.basic("overview")
     val BUILD = Path.basic("build")
+    val BUILD_CANCEL = Path.explode("build/cancel")
   }
 
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
@@ -663,6 +733,7 @@ object Build_System {
       case Home(state: State) extends Model
       case Overview(kind: String, state: State) extends Model
       case Build(name: String, state: State) extends Model
+      case Cancelled(job: Job) extends Model
     }
 
     object View {
@@ -670,6 +741,9 @@ object Build_System {
       import Web_App.More_HTML.*
 
       def render_if(cond: Boolean, body: XML.Body): XML.Body = if (cond) body else Nil
+      def render_link(kind: String): XML.Elem =
+        link(paths.frontend_url(Page.OVERVIEW, Markup.Kind(kind)).toString,
+          text(kind)) + ("target" -> "_parent")
       def render_link(name: String, number: Long): XML.Elem =
         link(
           paths.frontend_url(Page.BUILD, Markup.Name(name)).toString,
@@ -705,8 +779,7 @@ object Build_System {
             render_if(result.status != Status.ok, render_previous(finished.tail))
 
           fieldset(
-            XML.elem("legend", List(
-              link(paths.frontend_url(Page.OVERVIEW, Markup.Kind(kind)).toString, text(kind)))) ::
+            XML.elem("legend", List(render_link(kind))) ::
             (if (running.nonEmpty) render_job(running.head)
             else if (finished.nonEmpty) render_result(finished.head)
             else Nil))
@@ -751,6 +824,11 @@ object Build_System {
           state.finished.get(name).map(render_result)).getOrElse(
           text("Not found"))
       }
+
+      def render_cancelled(job: Job): XML.Body = {
+        chapter("Build Cancelled") ::
+          text("View log at: ") ::: render_link(job.name, job.number) :: Nil
+      }
     }
 
     private val server = new Web_App.Server[Model](paths, port, progress = progress) {
@@ -770,6 +848,22 @@ object Build_System {
           case _ => None
         }
 
+      val Id = new Properties.String(Markup.ID)
+      def cancel_build(props: Properties.T): Option[Model.Cancelled] =
+        props match {
+          case Id(UUID(id)) =>
+            synchronized_database("cancel_build") {
+              for (job <- _state.running.values.find(_.id == id)) yield {
+                val job1 = job.copy(cancelled = true)
+                _state = _state
+                  .remove_running(job1.name)
+                  .add_running(job1)
+                Model.Cancelled(job1)
+              }
+            }
+          case _ => None
+        }
+
       def render(model: Model): XML.Body =
         HTML.title("Isabelle Build System") :: (
           model match {
@@ -777,20 +871,22 @@ object Build_System {
             case Model.Home(state) => View.render_home(state)
             case Model.Overview(kind, state) => View.render_overview(kind, state)
             case Model.Build(name, state) => View.render_build(name, state)
+            case Model.Cancelled(job) => View.render_cancelled(job)
           })
 
       val error_model: Model = Model.Error
       val endpoints = List(
         Get(Page.HOME, "home", _ => overview),
         Get(Page.OVERVIEW, "overview", get_overview),
-        Get(Page.BUILD, "build", get_build))
+        Get(Page.BUILD, "build", get_build),
+        Get(Page.BUILD_CANCEL, "cancel build", cancel_build))
       val head = Nil
     }
 
     def init: Unit = server.start()
     def iterate(u: Unit): Unit = {
       if (progress.stopped) server.stop()
-      else synchronized_database("server") { }
+      else synchronized_database("iterate") { }
     }
   }
 
@@ -834,15 +930,24 @@ object Build_System {
 
     def remove(): Unit = Isabelle_System.rm_tree(dir)
 
-    def isabelle =
+    lazy val isabelle =
       Other_Isabelle(isabelle_dir, store.build_system_identifier, store.open_ssh(), progress)
 
-    def run(task: Task): Process_Result = {
+    def process(task: Task): Bash.Process = {
       isabelle.init(fresh = task.fresh_build, echo = true)
       val cmd = task.build_command(isabelle_dir, afp_path)
       progress.echo(cmd)
-      isabelle.bash(cmd, echo = true)
+
+      val env = Isabelle_System.export_env(
+        user_home = isabelle.ssh.user_home,
+        isabelle_identifier = isabelle.isabelle_identifier)
+
+      val script = env + "cd " + isabelle.ssh.bash_path(isabelle.isabelle_home) + "\n" + cmd
+      Bash.process(script, env = null)
     }
+
+    def run(process: Bash.Process): Process_Result =
+      process.result(progress_stdout = progress.echo(_), progress_stderr = progress.echo(_))
   }
 
 
