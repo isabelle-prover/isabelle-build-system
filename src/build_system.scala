@@ -31,14 +31,23 @@ object Build_System {
     case Revision(rev: String = "") extends Version
   }
 
-  sealed case class Task(
-    kind: String,
-    id: UUID.T = UUID.random(),
-    submit_date: Date = Date.now(),
-    priority: Priority = Priority.normal,
+  sealed trait Build_Config {
+    def name: String
+    def command(afp_root: Option[Path]): String
+    def fresh_build: Boolean
+  }
+
+  case class CI_Build(name: String) extends Build_Config {
+    def command(afp_root: Option[Path]): String = " ci_build " + name
+    def fresh_build: Boolean = true
+  }
+
+  object User_Build {
+    val name: String = "user"
+  }
+  
+  case class User_Build(
     prefs: List[Options.Spec] = Nil,
-    isabelle_version: Version = Version.Latest,
-    afp_version: Option[Version] = None,
     requirements: Boolean = false,
     all_sessions: Boolean = false,
     base_sessions: List[String] = Nil,
@@ -51,11 +60,10 @@ object Build_System {
     export_files: Boolean = false,
     fresh_build: Boolean = false,
     presentation: Boolean = false
-  ) extends Library.Named {
-    def name: String = id.toString
-
-    def build_command(isabelle_home: Path = Path.current, afp_root: Option[Path]): String = {
-      File.bash_path(Isabelle_Tool.exe(isabelle_home)) + " build" +
+  ) extends Build_Config {
+    def name: String = User_Build.name
+    def command(afp_root: Option[Path]): String = {
+      " build" +
         if_proper(afp_root, " -A " + File.bash_path(afp_root.get)) +
         base_sessions.map(session => " -B " + Bash.string(session)).mkString +
         if_proper(requirements, " -R") +
@@ -71,15 +79,25 @@ object Build_System {
     }
   }
 
+  sealed case class Task(
+    build_config: Build_Config,
+    id: UUID.T = UUID.random(),
+    submit_date: Date = Date.now(),
+    priority: Priority = Priority.normal,
+    isabelle_version: Version = Version.Latest,
+    afp_version: Option[Version] = None,
+  ) extends Library.Named {
+    def name: String = id.toString
+    def kind: String = build_config.name
+  }
+
   sealed case class Job(
     id: UUID.T,
     kind: String,
     number: Long,
-    prefs: List[Options.Spec],
     isabelle_version: String,
     afp_version: Option[String],
     start_date: Date = Date.now(),
-    estimate: Option[Date] = None,
     cancelled: Boolean = false
   ) extends Library.Named { def name: String = kind + "/" + number }
 
@@ -221,9 +239,10 @@ object Build_System {
       val id = SQL.Column.string("id").make_primary_key
       val submit_date = SQL.Column.date("submit_date")
       val priority = SQL.Column.string("priority")
-      val prefs = SQL.Column.string("prefs")
       val isabelle_version = SQL.Column.string("isabelle_version")
       val afp_version = SQL.Column.string("afp_version")
+
+      val prefs = SQL.Column.string("prefs")
       val requirements = SQL.Column.bool("requirements")
       val all_sessions = SQL.Column.bool("all_sessions")
       val base_sessions = SQL.Column.string("base_sessions")
@@ -238,7 +257,7 @@ object Build_System {
       val presentation = SQL.Column.bool("presentation")
 
       val table =
-        make_table(List(kind, id, submit_date, priority, prefs, isabelle_version, afp_version,
+        make_table(List(kind, id, submit_date, priority, isabelle_version, afp_version, prefs,
           requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
           session_groups, sessions, build_heap, clean_build, export_files, fresh_build,
           presentation),
@@ -252,27 +271,34 @@ object Build_System {
           val id = res.string(Pending.id)
           val submit_date = res.date(Pending.submit_date)
           val priority = Priority.valueOf(res.string(Pending.priority))
-          val prefs = Options.Spec.parse(res.string(Pending.prefs))
           val isabelle_version = Version.parse(res.string(Pending.isabelle_version))
           val afp_version = res.get_string(Pending.afp_version).map(Version.parse)
-          val requirements = res.bool(Pending.requirements)
-          val all_session = res.bool(Pending.all_sessions)
-          val base_sessions = space_explode(',', res.string(Pending.base_sessions))
-          val exclude_session_groups =
-            space_explode(',', res.string(Pending.exclude_session_groups))
-          val exclude_sessions = space_explode(',', res.string(Pending.exclude_sessions))
-          val session_groups = space_explode(',', res.string(Pending.session_groups))
-          val sessions = space_explode(',', res.string(Pending.sessions))
-          val build_heap = res.bool(Pending.build_heap)
-          val clean_build = res.bool(Pending.clean_build)
-          val export_files = res.bool(Pending.export_files)
-          val fresh_build = res.bool(Pending.fresh_build)
-          val presentation = res.bool(Pending.presentation)
 
-          val task = Task(kind, UUID.make(id), submit_date, priority, prefs, isabelle_version,
-            afp_version, requirements, all_session, base_sessions, exclude_session_groups,
-            exclude_sessions, session_groups, sessions, build_heap, clean_build, export_files,
-            fresh_build, presentation)
+          val build_config = 
+            if (kind != User_Build.name) CI_Build(kind)
+            else {
+              val prefs = Options.Spec.parse(res.string(Pending.prefs))
+              val requirements = res.bool(Pending.requirements)
+              val all_sessions = res.bool(Pending.all_sessions)
+              val base_sessions = space_explode(',', res.string(Pending.base_sessions))
+              val exclude_session_groups =
+                space_explode(',', res.string(Pending.exclude_session_groups))
+              val exclude_sessions = space_explode(',', res.string(Pending.exclude_sessions))
+              val session_groups = space_explode(',', res.string(Pending.session_groups))
+              val sessions = space_explode(',', res.string(Pending.sessions))
+              val build_heap = res.bool(Pending.build_heap)
+              val clean_build = res.bool(Pending.clean_build)
+              val export_files = res.bool(Pending.export_files)
+              val fresh_build = res.bool(Pending.fresh_build)
+              val presentation = res.bool(Pending.presentation)
+
+              User_Build(prefs, requirements, all_sessions, base_sessions, exclude_session_groups,
+                exclude_sessions, session_groups, sessions, build_heap, clean_build, export_files,
+                fresh_build, presentation)
+            }
+
+          val task =
+            Task(build_config, UUID.make(id), submit_date, priority, isabelle_version, afp_version)
 
           task.name -> task
         })
@@ -296,21 +322,26 @@ object Build_System {
             stmt.string(2) = task.id.toString
             stmt.date(3) = task.submit_date
             stmt.string(4) = task.priority.toString
-            stmt.string(5) = Options.Spec.bash_strings(task.prefs)
-            stmt.string(6) = task.isabelle_version.toString
-            stmt.string(7) = task.afp_version.map(_.toString)
-            stmt.bool(8) = task.requirements
-            stmt.bool(9) = task.all_sessions
-            stmt.string(10) = task.base_sessions.mkString(",")
-            stmt.string(11) = task.exclude_session_groups.mkString(",")
-            stmt.string(12) = task.exclude_sessions.mkString(",")
-            stmt.string(13) = task.session_groups.mkString(",")
-            stmt.string(14) = task.sessions.mkString(",")
-            stmt.bool(15) = task.build_heap
-            stmt.bool(16) = task.clean_build
-            stmt.bool(17) = task.export_files
-            stmt.bool(18) = task.fresh_build
-            stmt.bool(19) = task.presentation
+            stmt.string(5) = task.isabelle_version.toString
+            stmt.string(6) = task.afp_version.map(_.toString)
+
+            task.build_config match {
+              case user_build: User_Build =>
+                stmt.string(7) = Options.Spec.bash_strings(user_build.prefs)
+                stmt.bool(8) = user_build.requirements
+                stmt.bool(9) = user_build.all_sessions
+                stmt.string(10) = user_build.base_sessions.mkString(",")
+                stmt.string(11) = user_build.exclude_session_groups.mkString(",")
+                stmt.string(12) = user_build.exclude_sessions.mkString(",")
+                stmt.string(13) = user_build.session_groups.mkString(",")
+                stmt.string(14) = user_build.sessions.mkString(",")
+                stmt.bool(15) = user_build.build_heap
+                stmt.bool(16) = user_build.clean_build
+                stmt.bool(17) = user_build.export_files
+                stmt.bool(18) = user_build.fresh_build
+                stmt.bool(19) = user_build.presentation
+              case _ =>
+            }
           })
       }
 
@@ -324,16 +355,13 @@ object Build_System {
       val id = SQL.Column.string("id").make_primary_key
       val kind = SQL.Column.string("kind")
       val number = SQL.Column.long("number")
-      val prefs = SQL.Column.string("prefs")
       val isabelle_version = SQL.Column.string("isabelle_version")
       val afp_version = SQL.Column.string("afp_option")
       val start_date = SQL.Column.date("start_date")
-      val estimate = SQL.Column.date("estimate")
       val cancelled = SQL.Column.bool("cancelled")
 
       val table =
-        make_table(List(id, kind, number, prefs, isabelle_version,
-          afp_version, start_date, estimate, cancelled),
+        make_table(List(id, kind, number, isabelle_version, afp_version, start_date, cancelled),
         name = "running")
     }
 
@@ -343,15 +371,13 @@ object Build_System {
           val id = res.string(Running.id)
           val kind = res.string(Running.kind)
           val number = res.long(Running.number)
-          val prefs = Options.Spec.parse(res.string(Running.prefs))
           val isabelle_version = res.string(Running.isabelle_version)
           val afp_version = res.get_string(Running.afp_version)
           val start_date = res.date(Running.start_date)
-          val estimate = res.get_date(Running.estimate)
           val cancelled = res.bool(Running.cancelled)
 
-          val job = Job(UUID.make(id), kind, number, prefs, isabelle_version,
-            afp_version, start_date, estimate, cancelled)
+          val job =
+            Job(UUID.make(id), kind, number, isabelle_version, afp_version, start_date, cancelled)
 
           job.name -> job
         })
@@ -374,12 +400,10 @@ object Build_System {
             stmt.string(1) = job.id.toString
             stmt.string(2) = job.kind
             stmt.long(3) = job.number
-            stmt.string(4) = Options.Spec.bash_strings(job.prefs)
-            stmt.string(5) = job.isabelle_version
-            stmt.string(6) = job.afp_version
-            stmt.date(7) = job.start_date
-            stmt.date(8) = job.estimate
-            stmt.bool(9) = job.cancelled
+            stmt.string(4) = job.isabelle_version
+            stmt.string(5) = job.afp_version
+            stmt.date(6) = job.start_date
+            stmt.bool(7) = job.cancelled
           })
       }
       update
@@ -523,8 +547,8 @@ object Build_System {
     ) {
       def is_empty = processes.isEmpty && results.isEmpty
 
-      def init(task: Task, job: Job, context: Context): State = {
-        val process = Future.fork(context.process(task))
+      def init(build_config: Build_Config, job: Job, context: Context): State = {
+        val process = Future.fork(context.process(build_config))
         val result =
           Future.fork(Exn.capture(process.join) match {
             case Exn.Res(res) => context.run(res)
@@ -580,7 +604,7 @@ object Build_System {
       }
     }
 
-    private def start_next(): Option[(Task, Job)] =
+    private def start_next(): Option[(Build_Config, Job)] =
       synchronized_database("start_job") {
         _state.next.headOption.flatMap { task =>
           echo("Initializing " + task.id)
@@ -592,7 +616,7 @@ object Build_System {
               sync(isabelle_repository, task.isabelle_version, context.isabelle_dir)
             val afp_version = task.afp_version.map(sync(afp_repository, _, context.afp_dir))
 
-            Job(task.id, task.kind, number, task.prefs, isabelle_version, afp_version)
+            Job(task.id, task.kind, number, isabelle_version, afp_version)
           } match {
             case Exn.Res(job) =>
               _state = _state.add_running(job)
@@ -602,7 +626,7 @@ object Build_System {
               echo(msg)
               context1.progress.echo(msg)
 
-              Some(task, job)
+              Some(task.build_config, job)
             case Exn.Exn(exn) =>
               val result = Result(task.kind, number, Status.aborted)
               val context1 = Context(store, result)
@@ -650,7 +674,7 @@ object Build_System {
       if (state.is_empty && !progress.stopped) {
         start_next() match {
           case None => state
-          case Some((task, job)) => state.init(task, job, Context(store, job))
+          case Some((build_config, job)) => state.init(build_config, job, Context(store, job))
         }
       }
       else {
@@ -665,6 +689,7 @@ object Build_System {
   /* repository poller */
 
   class Poller(
+    ci_jobs: List[String],
     store: Store,
     isabelle_repository: Mercurial.Repository,
     afp_repository: Mercurial.Repository,
@@ -675,13 +700,13 @@ object Build_System {
 
     val init: (String, String) = (isabelle_repository.id(), afp_repository.id())
 
-    val kind = "isabelle-all"
-    def task =
-      Task(kind, priority = Priority.low, afp_version = Some(Version.Latest), all_sessions = true,
-        exclude_session_groups = Sessions.bulky_groups.toList, presentation = true)
+    def ci_task(name: String): Task =
+      Task(CI_Build(name), priority = Priority.low, afp_version = Some(Version.Latest))
 
     private def add_task(): Unit = synchronized_database("add_task") {
-      if (!_state.waiting.values.exists(_.kind == kind)) { _state = _state.add_pending(task) }
+      for (name <- ci_jobs if !_state.waiting.values.exists(_.kind == name)) {
+        _state = _state.add_pending(ci_task(name))
+      }
     }
 
     def iterate(ids: (String, String)): (String, String) =
@@ -933,9 +958,11 @@ object Build_System {
     lazy val isabelle =
       Other_Isabelle(isabelle_dir, store.build_system_identifier, store.open_ssh(), progress)
 
-    def process(task: Task): Bash.Process = {
-      isabelle.init(fresh = task.fresh_build, echo = true)
-      val cmd = task.build_command(isabelle_dir, afp_path)
+    def process(build_config: Build_Config): Bash.Process = {
+      isabelle.init(fresh = build_config.fresh_build, echo = true)
+
+      val cmd =
+        File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) + build_config.command(afp_path)
       progress.echo(cmd)
 
       val env = Isabelle_System.export_env(
@@ -990,12 +1017,12 @@ object Build_System {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
     val afp_repository = Mercurial.repository(afp_root.getOrElse(AFP.BASE))
-
+    val ci_jobs = space_explode(',', options.string("build_system_ci_jobs"))
     val paths = Web_App.Paths(Url(frontend + ":" + port), Path.current, true, Page.HOME)
 
     val processes = List(
       new Runner(store, isabelle_repository, afp_repository, progress),
-      new Poller(store, isabelle_repository, afp_repository, progress),
+      new Poller(ci_jobs, store, isabelle_repository, afp_repository, progress),
       new Web_Server(port, paths, store, progress))
 
     val threads = processes.map(new Thread(_))
@@ -1029,9 +1056,10 @@ object Build_System {
     val id = UUID.random()
     val afp_version = if (afp_root.nonEmpty) Some(Version.Local) else None
 
-    val task = Task("submission", id, Date.now(), Priority.high, prefs, Version.Local, afp_version,
-      requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
-      session_groups, sessions, build_heap, clean_build, export_files, fresh_build, presentation)
+    val build_config = User_Build(prefs, requirements, all_sessions, base_sessions,
+      exclude_session_groups, exclude_sessions, session_groups, sessions, build_heap, clean_build,
+      export_files, fresh_build, presentation)
+    val task = Task(build_config, id, Date.now(), Priority.high, Version.Local, afp_version)
 
     val context = Context(store, task)
 
