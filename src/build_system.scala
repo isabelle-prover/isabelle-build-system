@@ -13,6 +13,8 @@ import scala.annotation.tailrec
 object Build_System {
   /* task state synchronized via db */
 
+  sealed trait T extends Library.Named
+
   enum Priority { case low, normal, high }
 
   object Version {
@@ -86,7 +88,7 @@ object Build_System {
     priority: Priority = Priority.normal,
     isabelle_version: Version = Version.Latest,
     afp_version: Option[Version] = None,
-  ) extends Library.Named {
+  ) extends T {
     def name: String = id.toString
     def kind: String = build_config.name
   }
@@ -99,7 +101,7 @@ object Build_System {
     afp_version: Option[String],
     start_date: Date = Date.now(),
     cancelled: Boolean = false
-  ) extends Library.Named { def name: String = kind + "/" + number }
+  ) extends T { def name: String = kind + "/" + number }
 
   object Status {
     def from_result(result: Process_Result): Status = {
@@ -115,9 +117,10 @@ object Build_System {
     kind: String,
     number: Long,
     status: Status,
+    id: Option[UUID.T] = None,
     date: Date = Date.now(),
     serial: Long = 0,
-  ) extends Library.Named { def name: String = kind + "/" + number }
+  ) extends T { def name: String = kind + "/" + number }
 
   object State {
     def max_serial(serials: Iterable[Long]): Long = serials.maxOption.getOrElse(0L)
@@ -142,18 +145,13 @@ object Build_System {
     def add_pending(task: Task): State = copy(pending = pending + (task.name -> task))
     def remove_pending(name: String): State = copy(pending = pending - name)
 
-    def waiting: State.Pending = {
-      val running_ids = running.values.map(_.id).toSet
-      pending.filterNot((_, task) => running_ids.contains(task.id))
-    }
-
-    def size = waiting.size + running.size + finished.size
+    def size = pending.size + running.size + finished.size
 
     def next: List[Task] =
-      if (waiting.isEmpty) Nil
+      if (pending.isEmpty) Nil
       else {
-        val priority = waiting.values.map(_.priority).maxBy(_.ordinal)
-        waiting.values.filter(_.priority == priority).toList.sortBy(_.submit_date)(Date.Ordering)
+        val priority = pending.values.map(_.priority).maxBy(_.ordinal)
+        pending.values.filter(_.priority == priority).toList.sortBy(_.submit_date)(Date.Ordering)
       }
 
     def add_running(job: Job): State = copy(running = running + (job.name -> job))
@@ -173,8 +171,17 @@ object Build_System {
 
     def get_running(kind: String): List[Job] =
       (for ((_, job) <- running if job.kind == kind) yield job).toList
+
     def get_finished(kind: String): List[Result] =
       (for ((_, result) <- finished if result.kind == kind) yield result).toList
+
+    def get(name: String): Option[T] =
+      pending.get(name).orElse(running.get(name)).orElse(finished.get(name))
+
+    def get(id: UUID.T): Option[T] =
+      pending.values.find(_.id == id).orElse(
+        running.values.find(_.id == id)).orElse(
+        finished.values.find(_.id.contains(id)))
   }
 
 
@@ -416,10 +423,11 @@ object Build_System {
       val kind = SQL.Column.string("kind")
       val number = SQL.Column.long("number")
       val status = SQL.Column.string("status")
+      val id = SQL.Column.string("id")
       val date = SQL.Column.date("date")
       val serial = SQL.Column.long("serial").make_primary_key
 
-      val table = make_table(List(kind, number, status, date, serial), name = "finished")
+      val table = make_table(List(kind, number, status, id, date, serial), name = "finished")
     }
 
     def read_finished_serial(db: SQL.Database): Long =
@@ -441,10 +449,11 @@ object Build_System {
           val kind = res.string(Finished.kind)
           val number = res.long(Finished.number)
           val status = Status.valueOf(res.string(Finished.status))
+          val id = res.get_string(Finished.id).map(UUID.make)
           val date = res.date(Finished.date)
           val serial = res.long(Finished.serial)
 
-          val result = Result(kind, number, status, date, serial)
+          val result = Result(kind, number, status, id, date, serial)
           result.name -> result
         }
       )
@@ -466,8 +475,9 @@ object Build_System {
             stmt.string(1) = result.kind
             stmt.long(2) = result.number
             stmt.string(3) = result.status.toString
-            stmt.date(4) = result.date
-            stmt.long(5) = result.serial
+            stmt.string(4) = result.id.map(_.toString)
+            stmt.date(5) = result.date
+            stmt.long(6) = result.serial
           })
 
       old ++ insert.map(result => result.serial.toString -> result)
@@ -475,7 +485,7 @@ object Build_System {
   }
 
 
-  /* active processes: runner, poller */
+  /* active processes */
 
   abstract class Process(name: String, store: Store) extends Runnable {
     val options = store.options
@@ -607,6 +617,8 @@ object Build_System {
     private def start_next(): Option[(Build_Config, Job)] =
       synchronized_database("start_job") {
         _state.next.headOption.flatMap { task =>
+          _state = _state.remove_pending(task.name)
+
           echo("Initializing " + task.id)
           val context = Context(store, task)
           val number = _state.next_number(task.kind)
@@ -623,7 +635,7 @@ object Build_System {
               val context1 = context.move(Context(store, job))
 
               val msg = "Starting " + job.name
-              echo(msg)
+              echo(msg + " (id " + job.id + ")")
               context1.progress.echo(msg)
 
               Some(task.build_config, job)
@@ -636,9 +648,7 @@ object Build_System {
               context1.progress.echo_error_message(msg)
 
               context.remove()
-              _state = _state
-                .remove_pending(task.name)
-                .add_finished(result)
+              _state = _state.add_finished(result)
 
               None
           }
@@ -656,13 +666,12 @@ object Build_System {
         val job = _state.running(name)
         val context = Context(store, job)
 
-        val result = Result(job.kind, job.number, Status.from_result(process_result))
+        val result = Result(job.kind, job.number, Status.from_result(process_result), Some(job.id))
         context.copy_results(Context(store, result))
         context.remove()
         echo("Finished job " + job.id + " with status code " + process_result.rc)
 
         _state = _state
-          .remove_pending(job.id.toString)
           .remove_running(job.name)
           .add_finished(result)
     }
@@ -704,7 +713,7 @@ object Build_System {
       Task(CI_Build(name), priority = Priority.low, afp_version = Some(Version.Latest))
 
     private def add_task(): Unit = synchronized_database("add_task") {
-      for (name <- ci_jobs if !_state.waiting.values.exists(_.kind == name)) {
+      for (name <- ci_jobs if !_state.pending.values.exists(_.kind == name)) {
         _state = _state.add_pending(ci_task(name))
       }
     }
@@ -730,12 +739,12 @@ object Build_System {
 
   /* submission process */
 
-  class Submitter(task: Task, store: Store, progress: Progress)
+  class Submitter(server: String, task: Task, store: Store, progress: Progress)
     extends Process("Submitter", store) {
 
     private def add_task(): Unit = synchronized_database("add_task") {
-      progress.echo("Submitting task " + task.id)
       _state = _state.add_pending(task)
+      progress.echo("Submitted task. See " + server + "/build?id=" + task.id)
     }
     override def run(): Unit = add_task()
   }
@@ -748,20 +757,18 @@ object Build_System {
     val OVERVIEW = Path.basic("overview")
     val BUILD = Path.basic("build")
     val BUILD_CANCEL = Path.explode("build/cancel")
-  }
-
-  object API {
-    val CSS = Path.explode("api/isabelle.css")
+    val CSS = Path.explode("isabelle.css")
   }
 
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
     extends Loop_Process[Unit]("Web_Server", store, progress) {
+    val Id = new Properties.String(Markup.ID)
 
     enum Model {
       case Error extends Model
       case Home(state: State) extends Model
       case Overview(kind: String, state: State) extends Model
-      case Build(name: String, state: State) extends Model
+      case Build(elem: T, state: State, public: Boolean = true) extends Model
       case Cancelled(job: Job) extends Model
     }
 
@@ -789,11 +796,11 @@ object Build_System {
               par(
                 text("first failure: ") :::
                 render_link(result.name, result.number) ::
-                text("on " + result.date)))
+                text(" on " + result.date)))
             val last_success = rest.headOption.map(result =>
               par(
                 text("last success: ") ::: render_link(result.name, result.number) ::
-                text("on " + result.date)))
+                text(" on " + result.date)))
             first_failed.toList ::: last_success.toList
           }
 
@@ -815,7 +822,7 @@ object Build_System {
         }
 
         chapter("Dashboard") ::
-          text("Queue: " + state.waiting.size + " tasks waiting") :::
+          text("Queue: " + state.pending.size + " tasks waiting") :::
           section("Builds") :: text("Total: " + state.size + " builds") :::
           state.kinds.map(render_kind)
       }
@@ -835,23 +842,27 @@ object Build_System {
             state.get_finished(kind).sortBy(_.number).reverse.map(render_result)) :: Nil
       }
 
-      def render_build(name: String, state: State): XML.Body = {
-        def render_job(job: Job): XML.Body = {
-          par(text("Start: " + job.start_date)) ::
-          par(text("Running...")) ::
-          source(Context(store, job).log) :: Nil
-        }
+      def render_build(elem: T, state: State, public: Boolean): XML.Body = {
+        def render_cancel(id: UUID.T): XML.Body =
+          render_if(!public,
+            List(GUI.form(
+              List(
+                GUI.button(text("cancel build"), submit = true),
+                hidden(Web_App.Params.key(Id.name), id.toString)),
+              action = paths.api_route(Page.BUILD_CANCEL))))
 
-        def render_result(result: Result): XML.Body = {
-          par(text("Date: " + result.date)) ::
-          par(text("Status: " + result.status)) ::
-          source(Context(store, result).log) :: Nil
-        }
-
-        chapter(name) ::
-          state.running.get(name).map(render_job).orElse(
-          state.finished.get(name).map(render_result)).getOrElse(
-          text("Not found"))
+        chapter("Build " + elem.name) :: (elem match {
+          case task: Task =>
+            par(text("Task from " + task.submit_date + ". ")) :: render_cancel(task.id)
+          case job: Job =>
+            par(text("Start: " + job.start_date)) ::
+            par(text("Running...") ::: render_cancel(job.id)) ::
+            source(Context(store, job).log) :: Nil
+          case result: Result =>
+            par(text("Date: " + result.date)) ::
+            par(text("Status: " + result.status)) ::
+            source(Context(store, result).log) :: Nil
+        })
       }
 
       def render_cancelled(job: Job): XML.Body = {
@@ -873,21 +884,30 @@ object Build_System {
 
       def get_build(props: Properties.T): Option[Model.Build] =
         props match {
-          case Markup.Name(name) => Some(Model.Build(name, _state))
+          case Markup.Name(name) =>
+            val state = _state
+            state.get(name).map(Model.Build(_, state))
+          case Id(UUID(id)) =>
+            val state = _state
+            state.get(id).map(Model.Build(_, state, public = false))
           case _ => None
         }
 
-      val Id = new Properties.String(Markup.ID)
-      def cancel_build(props: Properties.T): Option[Model.Cancelled] =
+      def cancel_build(props: Properties.T): Option[Model] =
         props match {
           case Id(UUID(id)) =>
             synchronized_database("cancel_build") {
-              for (job <- _state.running.values.find(_.id == id)) yield {
-                val job1 = job.copy(cancelled = true)
-                _state = _state
-                  .remove_running(job1.name)
-                  .add_running(job1)
-                Model.Cancelled(job1)
+              _state.get(id).map {
+                case task: Task =>
+                  _state = _state.remove_pending(task.name)
+                  Model.Home(_state)
+                case job: Job =>
+                  val job1 = job.copy(cancelled = true)
+                  _state = _state
+                    .remove_running(job.name)
+                    .add_running(job1)
+                  Model.Cancelled(job1)
+                case result: Result => Model.Home(_state)
               }
             }
           case _ => None
@@ -899,7 +919,7 @@ object Build_System {
             case Model.Error => HTML.text("invalid request")
             case Model.Home(state) => View.render_home(state)
             case Model.Overview(kind, state) => View.render_overview(kind, state)
-            case Model.Build(name, state) => View.render_build(name, state)
+            case Model.Build(elem, state, public) => View.render_build(elem, state, public)
             case Model.Cancelled(job) => View.render_cancelled(job)
           })
 
@@ -909,8 +929,8 @@ object Build_System {
         Get(Page.OVERVIEW, "overview", get_overview),
         Get(Page.BUILD, "build", get_build),
         Get(Page.BUILD_CANCEL, "cancel build", cancel_build),
-        Get_File(API.CSS, "css", _ => Some(HTML.isabelle_css)))
-      val head = List(HTML.style_file(paths.api_route(API.CSS)))
+        Get_File(Page.CSS, "css", _ => Some(HTML.isabelle_css)))
+      val head = List(HTML.style_file(paths.api_route(Page.CSS)))
     }
 
     def init: Unit = server.start()
@@ -1016,14 +1036,14 @@ object Build_System {
     afp_root: Option[Path],
     options: Options,
     port: Int,
-    frontend: String,
     progress: Progress = new Progress
   ): Unit = {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
     val afp_repository = Mercurial.repository(afp_root.getOrElse(AFP.BASE))
     val ci_jobs = space_explode(',', options.string("build_system_ci_jobs"))
-    val paths = Web_App.Paths(Url(frontend + ":" + port), Path.current, true, Page.HOME)
+    val paths =
+      Web_App.Paths(Url(options.string("build_system_address")), Path.current, true, Page.HOME)
 
     val processes = List(
       new Runner(store, isabelle_repository, afp_repository, progress),
@@ -1041,6 +1061,7 @@ object Build_System {
   }
 
   def submit_build(
+    options: Options,
     store: Store,
     afp_root: Option[Path] = None,
     base_sessions: List[String] = Nil,
@@ -1077,7 +1098,8 @@ object Build_System {
           progress.echo("Cancelling submission...")
           ssh.delete(context.dir)
         } else {
-          val submitter = new Submitter(task, store, progress)
+          val submitter =
+            new Submitter(options.string("build_system_address"), task, store, progress)
           submitter.run()
         }
       }
@@ -1089,26 +1111,27 @@ object Build_System {
 
   /* Isabelle tool wrapper */
 
+  private val relevant_options = List("build_system_server", "build_system_submission_dir")
+  def show_options(options: Options): String =
+    cat_lines(relevant_options.flatMap(options.get).map(_.print))
+
   val isabelle_tool = Isabelle_Tool("build_system", "run build system", Scala_Project.here,
     { args =>
       var afp_root: Option[Path] = None
-      var frontend = "http://localhost"
       var options = Options.init()
-      var port = 8080
+      var port = 443
 
       val getopts = Getopts("""
 Usage: isabelle build_system [OPTIONS]
 
   Options are:
     -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
-    -b URL       application frontend url. Default: """ + frontend + """
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
     -p PORT      explicit web server port
 
-  Run Isabelle build system and server frontend.
-""",
+  Run Isabelle build system and server frontend, depending on system options:
+""" + Library.indent_lines(2, show_options(options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
-        "b:" -> (arg => frontend = arg),
         "o:" -> (arg => options = options + arg),
         "p:" -> (arg => port = Value.Int.parse(arg)))
 
@@ -1117,16 +1140,8 @@ Usage: isabelle build_system [OPTIONS]
 
       val progress = new Console_Progress()
 
-      build_system(afp_root = afp_root, options = options, port = port, frontend = frontend,
-        progress = progress)
+      build_system(afp_root = afp_root, options = options, port = port, progress = progress)
     })
-
-  private val relevant_options =
-    List(
-      "build_system_ssh_host",
-      "build_system_ssh_user",
-      "build_system_ssh_port",
-      "build_system_submission_dir")
 
   val isabelle_tool1 = Isabelle_Tool("submit_build", "submit build on build system",
     Scala_Project.here,
@@ -1145,9 +1160,6 @@ Usage: isabelle build_system [OPTIONS]
       var options = Options.init(specs = Options.Spec.ISABELLE_BUILD_OPTIONS)
       var prefs: List[Options.Spec] = Nil
       val exclude_sessions = new mutable.ListBuffer[String]
-
-      def show_options: String =
-        cat_lines(relevant_options.flatMap(options.get).map(_.print))
 
       val getopts = Getopts("""
 Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
@@ -1174,7 +1186,7 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
     -x NAME      exclude session NAME and all descendants
 
   Submit build on SSH server, depending on system options:
-""" + Library.indent_lines(2, show_options) + "\n",
+""" + Library.indent_lines(2, show_options(options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "B:" -> (arg => base_sessions += arg),
         "P" -> (_ => presentation = true),
@@ -1194,12 +1206,12 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
       val store = Store(options)
       val progress = new Console_Progress()
 
-      submit_build(store = store, afp_root = afp_root, base_sessions = base_sessions.toList,
-        presentation = presentation, requirements = requirements, exclude_session_groups =
-        exclude_session_groups.toList, all_sessions = all_sessions, build_heap = build_heap,
-        clean_build = clean_build, export_files = export_files, fresh_build = fresh_build,
-        session_groups = session_groups.toList, sessions = sessions, prefs = prefs,
-        exclude_sessions = exclude_sessions.toList, progress = progress)
+      submit_build(options, store = store, afp_root = afp_root, base_sessions =
+        base_sessions.toList, presentation = presentation, requirements = requirements,
+        exclude_session_groups = exclude_session_groups.toList, all_sessions = all_sessions,
+        build_heap = build_heap, clean_build = clean_build, export_files = export_files,
+        fresh_build = fresh_build, session_groups = session_groups.toList, sessions = sessions,
+        prefs = prefs, exclude_sessions = exclude_sessions.toList, progress = progress)
     })
 }
 
