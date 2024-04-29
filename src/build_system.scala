@@ -567,10 +567,11 @@ object Build_System {
       def init(build_config: Build_Config, job: Job, context: Context): State = {
         val process = Future.fork(context.process(build_config))
         val result =
-          Future.fork(Exn.capture(process.join) match {
-            case Exn.Res(res) => context.run(res)
-            case Exn.Exn(_) => Process_Result(Process_Result.RC.interrupt)
-          })
+          Future.fork(
+            process.join_result match {
+              case Exn.Res(res) => context.run(res)
+              case Exn.Exn(_) => Process_Result(Process_Result.RC.interrupt)
+            })
         new State(processes + (job.name -> process), results + (job.name -> result))
       }
 
@@ -593,7 +594,7 @@ object Build_System {
           else process.cancel()
         }
 
-        new State(processes.filterNot(cancelled.contains), results)
+        new State(processes.filterNot((name, _) => cancelled.contains(name)), results)
       }
     }
   }
@@ -764,34 +765,40 @@ object Build_System {
     val HOME = Path.basic("home")
     val OVERVIEW = Path.basic("overview")
     val BUILD = Path.basic("build")
-    val BUILD_CANCEL = Path.explode("build/cancel")
-    val CSS = Path.explode("isabelle.css")
+  }
+
+  object API {
+    val BUILD_CANCEL = Path.explode("api/build/cancel")
+    val CSS = Path.explode("api/isabelle.css")
   }
 
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
     extends Loop_Process[Unit]("Web_Server", store, progress) {
+    import Web_App.*
+
     val Id = new Properties.String(Markup.ID)
 
     enum Model {
       case Error extends Model
+      case Cancelled extends Model
       case Home(state: State) extends Model
       case Overview(kind: String, state: State) extends Model
       case Build(elem: T, state: State, public: Boolean = true) extends Model
-      case Cancelled(job: Job) extends Model
     }
 
     object View {
       import HTML.*
-      import Web_App.More_HTML.*
+      import More_HTML.*
 
       def render_if(cond: Boolean, body: XML.Body): XML.Body = if (cond) body else Nil
-      def render_link(kind: String): XML.Elem =
-        link(paths.frontend_url(Page.OVERVIEW, Markup.Kind(kind)).toString,
-          text(kind)) + ("target" -> "_parent")
-      def render_link(name: String, number: Long): XML.Elem =
-        link(
-          paths.frontend_url(Page.BUILD, Markup.Name(name)).toString,
-          text("#" + number)) + ("target" -> "_parent")
+
+      def frontend_link(url: Url, xml: XML.Body): XML.Elem =
+        link(url.toString, xml) + ("target" -> "_parent")
+
+      def link_kind(kind: String): XML.Elem =
+        frontend_link(paths.frontend_url(Page.OVERVIEW, Markup.Kind(kind)), text(kind))
+      def link_build(name: String, number: Long): XML.Elem =
+        frontend_link(paths.frontend_url(Page.BUILD, Markup.Name(name)), text("#" + number))
 
       def render_home(state: State): XML.Body = {
         def render_kind(kind: String): XML.Elem = {
@@ -803,27 +810,27 @@ object Build_System {
             val first_failed = failed.lastOption.map(result =>
               par(
                 text("first failure: ") :::
-                render_link(result.name, result.number) ::
+                link_build(result.name, result.number) ::
                 text(" on " + result.date)))
             val last_success = rest.headOption.map(result =>
               par(
-                text("last success: ") ::: render_link(result.name, result.number) ::
+                text("last success: ") ::: link_build(result.name, result.number) ::
                 text(" on " + result.date)))
             first_failed.toList ::: last_success.toList
           }
 
           def render_job(job: Job): XML.Body =
-            par(render_link(job.name, job.number) :: text(": running since " + job.start_date)) ::
+            par(link_build(job.name, job.number) :: text(": running since " + job.start_date)) ::
             render_if(finished.headOption.exists(_.status != Status.ok), render_previous(finished))
 
           def render_result(result: Result): XML.Body =
             par(
-              render_link(result.name, result.number) ::
+              link_build(result.name, result.number) ::
               text(" (" + result.status.toString + ") on " + result.date)) ::
             render_if(result.status != Status.ok, render_previous(finished.tail))
 
           fieldset(
-            XML.elem("legend", List(render_link(kind))) ::
+            XML.elem("legend", List(link_kind(kind))) ::
             (if (running.nonEmpty) render_job(running.head)
             else if (finished.nonEmpty) render_result(finished.head)
             else Nil))
@@ -837,11 +844,11 @@ object Build_System {
 
       def render_overview(kind: String, state: State): XML.Body = {
         def render_job(job: Job): XML.Body =
-          List(par(render_link(job.name, job.number) :: text(" running since " + job.start_date)))
+          List(par(link_build(job.name, job.number) :: text(" running since " + job.start_date)))
 
         def render_result(result: Result): XML.Body =
           List(par(
-            render_link(result.name, result.number) ::
+            link_build(result.name, result.number) ::
             text(" (" + result.status + ") on " + result.date)))
 
         chapter(kind) ::
@@ -850,21 +857,22 @@ object Build_System {
             state.get_finished(kind).sortBy(_.number).reverse.map(render_result)) :: Nil
       }
 
+      private val ID = Params.key(Markup.ID)
+
       def render_build(elem: T, state: State, public: Boolean): XML.Body = {
         def render_cancel(id: UUID.T): XML.Body =
-          render_if(!public,
-            List(GUI.form(
-              List(
-                GUI.button(text("cancel build"), submit = true),
-                hidden(Web_App.Params.key(Id.name), id.toString)),
-              action = paths.api_route(Page.BUILD_CANCEL))))
+          render_if(!public, List(
+            submit_form("", List(hidden(ID, id.toString),
+              api_button(paths.api_route(API.BUILD_CANCEL), "cancel build")))))
 
         chapter("Build " + elem.name) :: (elem match {
           case task: Task =>
             par(text("Task from " + task.submit_date + ". ")) :: render_cancel(task.id)
           case job: Job =>
             par(text("Start: " + job.start_date)) ::
-            par(text("Running...") ::: render_cancel(job.id)) ::
+            par(
+              if (job.cancelled) text("Cancelling...")
+              else text("Running...") ::: render_cancel(job.id)) ::
             source(Context(store, job).log) :: Nil
           case result: Result =>
             par(text("Date: " + result.date)) ::
@@ -873,13 +881,17 @@ object Build_System {
         })
       }
 
-      def render_cancelled(job: Job): XML.Body = {
-        chapter("Build Cancelled") ::
-          text("View log at: ") ::: render_link(job.name, job.number) :: Nil
-      }
+      def render_cancelled: XML.Body =
+        List(chapter("Build Cancelled"), frontend_link(paths.frontend_url(Page.HOME), text("Home")))
+
+      def parse_id(params: Params.Data): Option[UUID.T] =
+        for {
+          id <- params.get(ID)
+          uuid <- UUID.unapply(id)
+        } yield uuid
     }
 
-    private val server = new Web_App.Server[Model](paths, port, progress = progress) {
+    private val server = new Server[Model](paths, port, progress = progress) {
       /* control */
 
       def overview: Some[Model.Home] = Some(Model.Home(_state))
@@ -901,25 +913,25 @@ object Build_System {
           case _ => None
         }
 
-      def cancel_build(props: Properties.T): Option[Model] =
-        props match {
-          case Id(UUID(id)) =>
+      def cancel_build(params: Params.Data): Option[Model] =
+        for {
+          id <- View.parse_id(params)
+          model <-
             synchronized_database("cancel_build") {
               _state.get(id).map {
                 case task: Task =>
                   _state = _state.remove_pending(task.name)
-                  Model.Home(_state)
+                  Model.Cancelled
                 case job: Job =>
                   val job1 = job.copy(cancelled = true)
                   _state = _state
                     .remove_running(job.name)
                     .add_running(job1)
-                  Model.Cancelled(job1)
-                case result: Result => Model.Home(_state)
+                  Model.Build(job1, _state, public = false)
+                case result: Result => Model.Build(result, _state, public = false)
               }
             }
-          case _ => None
-        }
+        } yield model
 
       def render(model: Model): XML.Body =
         HTML.title("Isabelle Build System") :: (
@@ -928,7 +940,7 @@ object Build_System {
             case Model.Home(state) => View.render_home(state)
             case Model.Overview(kind, state) => View.render_overview(kind, state)
             case Model.Build(elem, state, public) => View.render_build(elem, state, public)
-            case Model.Cancelled(job) => View.render_cancelled(job)
+            case Model.Cancelled => View.render_cancelled
           })
 
       val error_model: Model = Model.Error
@@ -936,9 +948,9 @@ object Build_System {
         Get(Page.HOME, "home", _ => overview),
         Get(Page.OVERVIEW, "overview", get_overview),
         Get(Page.BUILD, "build", get_build),
-        Get(Page.BUILD_CANCEL, "cancel build", cancel_build),
-        Get_File(Page.CSS, "css", _ => Some(HTML.isabelle_css)))
-      val head = List(HTML.style_file(paths.api_route(Page.CSS)))
+        Post(API.BUILD_CANCEL, "cancel build", cancel_build),
+        Get_File(API.CSS, "css", _ => Some(HTML.isabelle_css)))
+      val head = List(HTML.style_file(paths.api_route(API.CSS)))
     }
 
     def init: Unit = server.start()
