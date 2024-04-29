@@ -1149,6 +1149,7 @@ object Build_System {
         progress.echo("Transferring repositories...")
         Sync.sync(store.options, rsync_context, context.isabelle_dir, preserve_jars = true,
           afp_root = afp_root)
+        ssh.execute("chmod -R g+rwx " + context.dir)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
           ssh.rm_tree(context.dir)
