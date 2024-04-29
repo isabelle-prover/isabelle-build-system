@@ -774,6 +774,7 @@ object Build_System {
     val CSS = Path.explode("api/isabelle.css")
   }
 
+  // TODO: allow HEAD request for post endpoints, to enable reloading via live.js
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
     extends Loop_Process[Unit]("Web_Server", store, progress) {
     import Web_App.*
@@ -1161,9 +1162,22 @@ object Build_System {
 
   /* Isabelle tool wrapper */
 
-  private val relevant_options = List("build_system_server", "build_system_dir")
-  def show_options(options: Options): String =
-    cat_lines(relevant_options.flatMap(options.get).map(_.print))
+  private def show_relevant_options(relevant: List[String], options: Options): String = {
+    val connection_options =
+      for {
+        option <- options.iterator
+        if option.name.startsWith("build_system") && option.for_tag(Options.TAG_CONNECTION)
+      } yield option
+
+    cat_lines((relevant.flatMap(options.get) ::: connection_options.toList).map(_.print))
+  }
+
+  private val relevant_server_options =
+    List(
+      "build_system_delay",
+      "build_system_poll_delay",
+      "build_system_dir",
+      "build_system_identifier")
 
   val isabelle_tool = Isabelle_Tool("build_system", "run build system", Scala_Project.here,
     { args =>
@@ -1183,7 +1197,7 @@ Usage: isabelle build_system [OPTIONS]
     -p PORT      explicit web server port
 
   Run Isabelle build system and server frontend, depending on system options:
-""" + Library.indent_lines(2, show_options(options)) + "\n",
+""" + Library.indent_lines(2, show_relevant_options(relevant_server_options, options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "H:" -> (arg => build_hosts ++= Build_Cluster.Host.parse(Registry.global, arg)),
         "o:" -> (arg => options = options + arg),
@@ -1197,6 +1211,8 @@ Usage: isabelle build_system [OPTIONS]
       build_system(afp_root = afp_root, build_hosts = build_hosts.toList, options = options,
         port = port, progress = progress)
     })
+
+  val relevant_client_options = List("build_system_dir")
 
   val isabelle_tool1 = Isabelle_Tool("submit_build", "submit build on build system",
     Scala_Project.here,
@@ -1241,7 +1257,7 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
     -x NAME      exclude session NAME and all descendants
 
   Submit build on SSH server, depending on system options:
-""" + Library.indent_lines(2, show_options(options)) + "\n",
+""" + Library.indent_lines(2, show_relevant_options(relevant_client_options, options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "B:" -> (arg => base_sessions += arg),
         "P" -> (_ => presentation = true),
@@ -1268,6 +1284,8 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
         fresh_build = fresh_build, session_groups = session_groups.toList, sessions = sessions,
         prefs = prefs, exclude_sessions = exclude_sessions.toList, progress = progress)
     })
+
+  // TODO more Isabelle tools, e.g. to cancel builds, edit builds...
 }
 
 class Build_System_Tools extends Isabelle_Scala_Tools(
