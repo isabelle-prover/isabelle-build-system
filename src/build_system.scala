@@ -508,7 +508,7 @@ object Build_System {
     protected var _state = State()
 
     protected def synchronized_database[A](label: String)(body: => A): A = synchronized {
-      Build_System.private_data.transaction_lock(_database, create = true,
+      Build_System.private_data.transaction_lock(_database,
         label = name + "." + label) {
         val old_state = Build_System.private_data.pull_state(_database, _state)
         _state = old_state
@@ -1099,6 +1099,10 @@ object Build_System {
       new Runner(store, build_hosts, isabelle_repository, afp_repository, progress),
       new Poller(ci_jobs, store, isabelle_repository, afp_repository, progress),
       new Web_Server(port, paths, store, progress))
+
+    using(store.open_database())(db =>
+      Build_System.private_data.transaction_lock(db,
+        create = true, label = "Build_System.build_system"))
 
     val threads = processes.map(new Thread(_))
     POSIX_Interrupt.handler {
