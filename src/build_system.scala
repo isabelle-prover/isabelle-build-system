@@ -35,12 +35,13 @@ object Build_System {
 
   sealed trait Build_Config {
     def name: String
-    def command(afp_root: Option[Path]): String
+    def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String
     def fresh_build: Boolean
   }
 
   case class CI_Build(name: String) extends Build_Config {
-    def command(afp_root: Option[Path]): String = " ci_build " + name
+    def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String =
+      " ci_build " + name
     def fresh_build: Boolean = true
   }
 
@@ -64,17 +65,18 @@ object Build_System {
     presentation: Boolean = false
   ) extends Build_Config {
     def name: String = User_Build.name
-    def command(afp_root: Option[Path]): String = {
+    def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String = {
       " build" +
         if_proper(afp_root, " -A " + File.bash_path(afp_root.get)) +
         base_sessions.map(session => " -B " + Bash.string(session)).mkString +
+        build_hosts.map(host => " -H " + Bash.string(host.print)).mkString +
+        if_proper(presentation, " -P:") +
         if_proper(requirements, " -R") +
         if_proper(all_sessions, " -a") +
         if_proper(build_heap, " -b") +
         if_proper(clean_build, " -c") +
         if_proper(export_files, " -e") +
         if_proper(fresh_build, " -f") +
-        if_proper(presentation, " -P:") +
         Options.Spec.bash_strings(prefs, bg = true) +
         " -v" +
         sessions.map(session => " " + Bash.string(session)).mkString
@@ -593,6 +595,7 @@ object Build_System {
 
   class Runner(
     store: Store,
+    build_hosts: List[Build_Cluster.Host],
     isabelle_repository: Mercurial.Repository,
     afp_repository: Mercurial.Repository,
     progress: Progress
@@ -620,7 +623,7 @@ object Build_System {
           _state = _state.remove_pending(task.name)
 
           echo("Initializing " + task.id)
-          val context = Context(store, task)
+          val context = Context(store, task, build_hosts)
           val number = _state.next_number(task.kind)
 
           Exn.capture {
@@ -664,7 +667,7 @@ object Build_System {
     private def finish_job(name: String, process_result: Process_Result): Unit =
       synchronized_database("finish_job") {
         val job = _state.running(name)
-        val context = Context(store, job)
+        val context = Context(store, job, build_hosts)
 
         val result = Result(job.kind, job.number, Status.from_result(process_result), Some(job.id))
         context.copy_results(Context(store, result))
@@ -683,7 +686,8 @@ object Build_System {
       if (state.is_empty && !progress.stopped) {
         start_next() match {
           case None => state
-          case Some((build_config, job)) => state.init(build_config, job, Context(store, job))
+          case Some((build_config, job)) =>
+            state.init(build_config, job, Context(store, job, build_hosts))
         }
       }
       else {
@@ -944,8 +948,15 @@ object Build_System {
   /* context */
 
   object Context {
-    def apply(store: Store, task: Task): Context =
-      new Context(store, store.dir(task), task.afp_version.isDefined)
+    def apply(store: Store, elem: T, build_hosts: List[Build_Cluster.Host] = Nil): Context = {
+      val afp =
+        elem match {
+          case Task(_, _, _, _, _, Some(_)) | Job(_, _, _, _, Some(_), _, _) => true
+          case _ => false
+        }
+        
+      new Context(store, store.dir(elem), afp, build_hosts)
+    }
 
     def apply(store: Store, job: Job): Context =
       new Context(store, store.dir(job), job.afp_version.isDefined)
@@ -953,7 +964,12 @@ object Build_System {
     def apply(store: Store, result: Result): Context = new Context(store, store.dir(result))
   }
 
-  class Context private(store: Store, val dir: Path, val afp: Boolean = false) {
+  class Context private(
+    store: Store,
+    val dir: Path,
+    val afp: Boolean = false,
+    val build_hosts: List[Build_Cluster.Host] = Nil
+  ) {
     def isabelle_dir: Path = dir + Path.basic("isabelle")
     def afp_dir: Path = isabelle_dir + Path.basic("AFP")
     def afp_path: Option[Path] = if (afp) Some(afp_dir) else None
@@ -986,8 +1002,8 @@ object Build_System {
     def process(build_config: Build_Config): Bash.Process = {
       isabelle.init(fresh = build_config.fresh_build, echo = true)
 
-      val cmd =
-        File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) + build_config.command(afp_path)
+      val cmd = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) +
+        build_config.command(afp_path, build_hosts)
       progress.echo(cmd)
 
       val env = Isabelle_System.export_env(
@@ -1009,10 +1025,12 @@ object Build_System {
     val base_dir = Path.explode(options.string("build_system_submission_dir"))
     val build_system_identifier = options.string("build_system_identifier")
 
-    def dir(task: Task): Path = base_dir + Path.make(List("pending", task.id.toString))
-    def dir(job: Job): Path = base_dir + Path.make(List("running", job.kind, job.number.toString))
-    def dir(result: Result): Path =
-      base_dir + Path.make(List("finished", result.kind, result.number.toString))
+    def dir(elem: T): Path = base_dir + (
+      elem match {
+        case task: Task => Path.make(List("pending", task.id.toString))
+        case job: Job => Path.make(List("running", job.kind, job.number.toString))
+        case result: Result => Path.make(List("finished", result.kind, result.number.toString))
+      })
 
     def open_ssh(): SSH.System =
       SSH.open_system(options,
@@ -1034,6 +1052,7 @@ object Build_System {
 
   def build_system(
     afp_root: Option[Path],
+    build_hosts: List[Build_Cluster.Host],
     options: Options,
     port: Int,
     progress: Progress = new Progress
@@ -1046,7 +1065,7 @@ object Build_System {
       Web_App.Paths(Url(options.string("build_system_address")), Path.current, true, Page.HOME)
 
     val processes = List(
-      new Runner(store, isabelle_repository, afp_repository, progress),
+      new Runner(store, build_hosts, isabelle_repository, afp_repository, progress),
       new Poller(ci_jobs, store, isabelle_repository, afp_repository, progress),
       new Web_Server(port, paths, store, progress))
 
@@ -1096,7 +1115,7 @@ object Build_System {
         Sync.sync(store.options, rsync_context, context.isabelle_dir, afp_root = afp_root)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
-          ssh.delete(context.dir)
+          ssh.rm_tree(context.dir)
         } else {
           val submitter =
             new Submitter(options.string("build_system_address"), task, store, progress)
@@ -1118,6 +1137,7 @@ object Build_System {
   val isabelle_tool = Isabelle_Tool("build_system", "run build system", Scala_Project.here,
     { args =>
       var afp_root: Option[Path] = None
+      val build_hosts = new mutable.ListBuffer[Build_Cluster.Host]
       var options = Options.init()
       var port = 443
 
@@ -1126,12 +1146,15 @@ Usage: isabelle build_system [OPTIONS]
 
   Options are:
     -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
+    -H HOSTS     additional cluster host specifications of the form
+                 NAMES:PARAMETERS (separated by commas)
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
     -p PORT      explicit web server port
 
   Run Isabelle build system and server frontend, depending on system options:
 """ + Library.indent_lines(2, show_options(options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
+        "H:" -> (arg => build_hosts ++= Build_Cluster.Host.parse(Registry.global, arg)),
         "o:" -> (arg => options = options + arg),
         "p:" -> (arg => port = Value.Int.parse(arg)))
 
@@ -1140,7 +1163,8 @@ Usage: isabelle build_system [OPTIONS]
 
       val progress = new Console_Progress()
 
-      build_system(afp_root = afp_root, options = options, port = port, progress = progress)
+      build_system(afp_root = afp_root, build_hosts = build_hosts.toList, options = options,
+        port = port, progress = progress)
     })
 
   val isabelle_tool1 = Isabelle_Tool("submit_build", "submit build on build system",
