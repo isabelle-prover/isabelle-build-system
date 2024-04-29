@@ -627,7 +627,6 @@ object Build_System {
         _state.next.headOption.flatMap { task =>
           _state = _state.remove_pending(task.name)
 
-          echo("Initializing " + task.id)
           val context = Context(store, task, build_hosts)
           val number = _state.next_number(task.kind)
 
@@ -1001,10 +1000,10 @@ object Build_System {
 
     def remove(): Unit = Isabelle_System.rm_tree(dir)
 
-    lazy val isabelle =
-      Other_Isabelle(isabelle_dir, store.build_system_identifier, store.open_ssh(), progress)
+    lazy val ssh = store.open_ssh()
 
     def process(build_config: Build_Config): Bash.Process = {
+      val isabelle = Other_Isabelle(isabelle_dir, store.build_system_identifier, ssh, progress)
       isabelle.init(fresh = build_config.fresh_build, echo = true)
 
       val cmd = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) +
@@ -1012,15 +1011,26 @@ object Build_System {
       progress.echo(cmd)
 
       val env = Isabelle_System.export_env(
-        user_home = isabelle.ssh.user_home,
+        user_home = ssh.user_home,
         isabelle_identifier = isabelle.isabelle_identifier)
 
-      val script = env + "cd " + isabelle.ssh.bash_path(isabelle.isabelle_home) + "\n" + cmd
-      Bash.process(script, env = null)
+      val cmd_line = env + "cd " + ssh.bash_path(isabelle.isabelle_home) + "\n" + cmd
+      val script = Isabelle_System.export_env(user_home = ssh.user_home) + cmd_line
+      val args = Bash.string(ssh.host) + " " + Bash.string(script)
+
+      val config = SSH.Config.make(ssh.options, port = ssh.port, user = ssh.user, control_path =
+        ssh.control_path)
+
+      val ssh_cmd = SSH.Config.command("ssh", config) + if_proper(args, " -- " + args)
+      Bash.process(ssh_cmd, env = null)
     }
 
-    def run(process: Bash.Process): Process_Result =
-      process.result(progress_stdout = progress.echo(_), progress_stderr = progress.echo(_))
+    def run(process: Bash.Process): Process_Result = {
+      val process_result =
+        process.result(progress_stdout = progress.echo(_), progress_stderr = progress.echo(_))
+      ssh.close()
+      process_result
+    }
   }
 
 
@@ -1037,8 +1047,8 @@ object Build_System {
         case result: Result => Path.make(List("finished", result.kind, result.number.toString))
       })
 
-    def open_ssh(): SSH.System =
-      SSH.open_system(options,
+    def open_ssh(): SSH.Session =
+      SSH.open_session(options,
         host = options.string("build_system_ssh_host"),
         port = options.int("build_system_ssh_port"),
         user = options.string("build_system_ssh_user"))
