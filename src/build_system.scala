@@ -41,7 +41,9 @@ object Build_System {
 
   case class CI_Build(name: String) extends Build_Config {
     def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String =
-      " ci_build " + name // TODO afp requires more sync: scala components need to be present as well
+      " build -g timing"
+    // TODO ci_build requires synced intact hg repository
+    // TODO afp requires more sync: scala components need to be present as well
     def fresh_build: Boolean = true
   }
 
