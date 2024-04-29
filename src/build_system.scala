@@ -1050,7 +1050,7 @@ object Build_System {
   /* build system store */
 
   case class Store(options: Options) {
-    val base_dir = Path.explode(options.string("build_system_submission_dir"))
+    val base_dir = Path.explode(options.string("build_system_dir"))
     val build_system_identifier = options.string("build_system_identifier")
 
     def dir(elem: T): Path = base_dir + (
@@ -1159,7 +1159,7 @@ object Build_System {
 
   /* Isabelle tool wrapper */
 
-  private val relevant_options = List("build_system_server", "build_system_submission_dir")
+  private val relevant_options = List("build_system_server", "build_system_dir")
   def show_options(options: Options): String =
     cat_lines(relevant_options.flatMap(options.get).map(_.print))
 
