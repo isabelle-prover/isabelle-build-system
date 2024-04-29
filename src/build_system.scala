@@ -41,7 +41,7 @@ object Build_System {
 
   case class CI_Build(name: String) extends Build_Config {
     def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String =
-      " ci_build " + name
+      " ci_build " + name // TODO afp requires more sync: scala components need to be present as well
     def fresh_build: Boolean = true
   }
 
@@ -69,7 +69,7 @@ object Build_System {
       " build" +
         if_proper(afp_root, " -A " + File.bash_path(afp_root.get)) +
         base_sessions.map(session => " -B " + Bash.string(session)).mkString +
-        build_hosts.map(host => " -H " + Bash.string(host.print)).mkString +
+        /* TODO this needs Sync.sync to sync repository as well build_hosts.map(host => " -H " + Bash.string(host.print)).mkString + */
         if_proper(presentation, " -P:") +
         if_proper(requirements, " -R") +
         if_proper(all_sessions, " -a") +
@@ -1006,6 +1006,7 @@ object Build_System {
       val isabelle = Other_Isabelle(isabelle_dir, store.build_system_identifier, ssh, progress)
       isabelle.init(fresh = build_config.fresh_build, echo = true)
 
+      // TODO this requires Other_Isabelle.bash / ssh.execute / ssh.run_command to give access to bash process
       val cmd = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) +
         build_config.command(afp_path, build_hosts)
       progress.echo(cmd)
@@ -1127,7 +1128,8 @@ object Build_System {
       using(store.open_ssh()) { ssh =>
         val rsync_context = Rsync.Context(ssh = ssh)
         progress.echo("Transferring repositories...")
-        Sync.sync(store.options, rsync_context, context.isabelle_dir, afp_root = afp_root)
+        Sync.sync(store.options, rsync_context, context.isabelle_dir, preserve_jars = true,
+          afp_root = afp_root)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
           ssh.rm_tree(context.dir)
