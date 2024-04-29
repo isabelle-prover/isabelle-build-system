@@ -235,7 +235,10 @@ object Build_System {
       else {
         val serial = state.next_serial
         db.execute_statement(State.table.delete(State.serial.where_equal(old_state.serial)))
-        db.execute_statement(State.table.insert(), body = { stmt => stmt.long(1) = serial })
+        db.execute_statement(State.table.insert(), body =
+          { (stmt: SQL.Statement) =>
+            stmt.long(1) = serial
+          })
         state.copy(serial = serial, finished = finished)
       }
     }
@@ -325,7 +328,7 @@ object Build_System {
 
       if (update.inserts) {
         db.execute_batch_statement(Pending.table.insert(), batch =
-          for (name <- update.insert) yield { stmt =>
+          for (name <- update.insert) yield { (stmt: SQL.Statement) =>
             val task = pending(name)
             stmt.string(1) = task.kind
             stmt.string(2) = task.id.toString
@@ -334,23 +337,25 @@ object Build_System {
             stmt.string(5) = task.isabelle_version.toString
             stmt.string(6) = task.afp_version.map(_.toString)
 
-            task.build_config match {
-              case user_build: User_Build =>
-                stmt.string(7) = Options.Spec.bash_strings(user_build.prefs)
-                stmt.bool(8) = user_build.requirements
-                stmt.bool(9) = user_build.all_sessions
-                stmt.string(10) = user_build.base_sessions.mkString(",")
-                stmt.string(11) = user_build.exclude_session_groups.mkString(",")
-                stmt.string(12) = user_build.exclude_sessions.mkString(",")
-                stmt.string(13) = user_build.session_groups.mkString(",")
-                stmt.string(14) = user_build.sessions.mkString(",")
-                stmt.bool(15) = user_build.build_heap
-                stmt.bool(16) = user_build.clean_build
-                stmt.bool(17) = user_build.export_files
-                stmt.bool(18) = user_build.fresh_build
-                stmt.bool(19) = user_build.presentation
-              case _ =>
-            }
+            def get[A](f: User_Build => A): Option[A] = 
+              task.build_config match {
+                case user_build: User_Build => Some(f(user_build))
+                case _ => None
+              }
+            
+            stmt.string(7) = get(user_build => Options.Spec.bash_strings(user_build.prefs))
+            stmt.bool(8) = get(_.requirements)
+            stmt.bool(9) = get(_.all_sessions)
+            stmt.string(10) = get(_.base_sessions.mkString(","))
+            stmt.string(11) = get(_.exclude_session_groups.mkString(","))
+            stmt.string(12) = get(_.exclude_sessions.mkString(","))
+            stmt.string(13) = get(_.session_groups.mkString(","))
+            stmt.string(14) = get(_.sessions.mkString(","))
+            stmt.bool(15) = get(_.build_heap)
+            stmt.bool(16) = get(_.clean_build)
+            stmt.bool(17) = get(_.export_files)
+            stmt.bool(18) = get(_.fresh_build)
+            stmt.bool(19) = get(_.presentation)
           })
       }
 
@@ -404,7 +409,7 @@ object Build_System {
 
       if (update.inserts) {
         db.execute_batch_statement(Running.table.insert(), batch =
-          for (name <- update.insert) yield { stmt =>
+          for (name <- update.insert) yield { (stmt: SQL.Statement) =>
             val job = running(name)
             stmt.string(1) = job.id.toString
             stmt.string(2) = job.kind
@@ -473,7 +478,7 @@ object Build_System {
 
       if (insert.nonEmpty)
         db.execute_batch_statement(Finished.table.insert(), batch =
-          for (result <- insert) yield { stmt =>
+          for (result <- insert) yield { (stmt: SQL.Statement) =>
             stmt.string(1) = result.kind
             stmt.long(2) = result.number
             stmt.string(3) = result.status.toString
