@@ -1100,9 +1100,8 @@ object Build_System {
       new Poller(ci_jobs, store, isabelle_repository, afp_repository, progress),
       new Web_Server(port, paths, store, progress))
 
-    using(store.open_database())(db =>
-      Build_System.private_data.transaction_lock(db,
-        create = true, label = "Build_System.build_system"))
+    using(store.open_database())(
+      Build_System.private_data.tables.lock(_, create = true, label = "Build_System.build_system"))
 
     val threads = processes.map(new Thread(_))
     POSIX_Interrupt.handler {
