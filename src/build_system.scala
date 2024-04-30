@@ -494,9 +494,10 @@ object Build_System {
   }
 
 
-  /* active processes */
+  /* running build system processes */
 
-  abstract class Process(name: String, store: Store) extends Runnable {
+  abstract class Loop_Process[A](name: String, store: Store, progress: Progress)
+    extends Runnable {
     val options = store.options
 
     private val _database =
@@ -516,10 +517,7 @@ object Build_System {
         res
       }
     }
-  }
 
-  abstract class Loop_Process[A](name: String, store: Store, progress: Progress)
-    extends Process(name, store) {
     protected def delay = options.seconds("build_system_delay")
 
     def init: A
@@ -744,19 +742,6 @@ object Build_System {
           }
           ids1
       }
-  }
-
-
-  /* submission process */
-
-  class Submitter(server: String, task: Task, store: Store, progress: Progress)
-    extends Process("Submitter", store) {
-
-    private def add_task(): Unit = synchronized_database("add_task") {
-      _state = _state.add_pending(task)
-      progress.echo("Submitted task. See " + server + "/build?id=" + task.id)
-    }
-    override def run(): Unit = add_task()
   }
 
 
@@ -1078,6 +1063,14 @@ object Build_System {
         ssh_host = options.string("build_system_database_ssh_host"),
         ssh_port = options.int("build_system_database_ssh_port"),
         ssh_user = options.string("build_system_database_ssh_user"))
+
+    def open_postgresql_server(): SSH.Server =
+      PostgreSQL.open_server(options,
+        host = options.string("build_system_database_host"),
+        port = options.int("build_system_database_port"),
+        ssh_host = options.string("build_system_ssh_host"),
+        ssh_port = options.int("build_system_ssh_port"),
+        ssh_user = options.string("build_system_ssh_user"))
   }
 
   def build_system(
@@ -1148,14 +1141,22 @@ object Build_System {
         progress.echo("Transferring repositories...")
         Sync.sync(store.options, rsync_context, context.isabelle_dir, preserve_jars = true,
           afp_root = afp_root)
-        ssh.execute("chmod -R g+rwx " + context.dir)
+        ssh.execute("chmod -R ga+rwx " + context.dir)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
           ssh.rm_tree(context.dir)
         } else {
-          val submitter =
-            new Submitter(options.string("build_system_address"), task, store, progress)
-          submitter.run()
+          using(store.open_postgresql_server()) { server =>
+            using(store.open_database(server = server)) { db =>
+              Build_System.private_data.transaction_lock(db, label = "Build_System.submit_build") {
+                val old_state = Build_System.private_data.pull_state(db, State())
+                val state = old_state.add_pending(task)
+                Build_System.private_data.push_state(db, old_state, state)
+              }
+            }
+          }
+          val address = options.string("build_system_address")
+          progress.echo("Submitted task. See " + address + "/build?id=" + task.id)
         }
       }
     }
