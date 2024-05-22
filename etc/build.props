@@ -1,7 +1,7 @@
-title = Build System
-module = $BUILD_SYSTEM_JAR
+title = Build Manager
+module = $BUILD_MANAGER_JAR
 requirements = \
   env:ISABELLE_SCALA_JAR
 sources = \
-  src/build_system.scala
-services = isabelle.Build_System_Tools
+  src/build_manager.scala
+services = isabelle.Build_Manager_Tools

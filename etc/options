@@ -1,38 +1,38 @@
 (* :mode=isabelle-options: *)
 
-section "Build System"
+section "Build Manager"
 
-option build_system_delay : real = 1.0
-  -- "delay build system loop"
+option build_manager_delay : real = 1.0
+  -- "delay build manager loop"
 
-option build_system_poll_delay : real = 60.0
-  -- "delay build system poll loop"
+option build_manager_poll_delay : real = 60.0
+  -- "delay build manager poll loop"
 
-option build_system_dir : string = "/srv/build"
+option build_manager_dir : string = "/srv/build"
   -- "directory for submissions on build server"
 
-option build_system_identifier : string = "build_system"
-  -- "isabelle identifier for build system processes"
+option build_manager_identifier : string = "build_manager"
+  -- "isabelle identifier for build manager processes"
   
-option build_system_ci_jobs : string = "benchmark"
+option build_manager_ci_jobs : string = "benchmark"
   -- "ci jobs that should be executed on repository changes"
 
-option build_system_address : string = "https://build.proof.cit.tum.de"
+option build_manager_address : string = "https://build.proof.cit.tum.de"
   -- "web address for build server"
 
-section "Build System SSH"
+section "Build Manager SSH"
 
-option build_system_ssh_host : string = "build.proof.cit.tum.de" for connection
-option build_system_ssh_user : string = "" for connection
-option build_system_ssh_port : int = 0 for connection
+option build_manager_ssh_host : string = "build.proof.cit.tum.de" for connection
+option build_manager_ssh_user : string = "" for connection
+option build_manager_ssh_port : int = 0 for connection
 
-section "Build System Database"
+section "Build Manager Database"
 
-option build_system_database_user : string = "isabelle" for connection
-option build_system_database_password : string = "" for connection
-option build_system_database_name : string = "isabelle_build_system" for connection
-option build_system_database_host : string = "localhost" for connection
-option build_system_database_port : int = 5432 for connection
-option build_system_database_ssh_host : string = "" for connection
-option build_system_database_ssh_user : string = "" for connection
-option build_system_database_ssh_port : int = 0 for connection
+option build_manager_database_user : string = "isabelle" for connection
+option build_manager_database_password : string = "" for connection
+option build_manager_database_name : string = "isabelle_build_manager" for connection
+option build_manager_database_host : string = "localhost" for connection
+option build_manager_database_port : int = 5432 for connection
+option build_manager_database_ssh_host : string = "" for connection
+option build_manager_database_ssh_user : string = "" for connection
+option build_manager_database_ssh_port : int = 0 for connection

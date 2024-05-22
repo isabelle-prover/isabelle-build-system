@@ -10,7 +10,7 @@ import scala.collection.mutable
 import scala.annotation.tailrec
 
 
-object Build_System {
+object Build_Manager {
   /* task state synchronized via db */
 
   sealed trait T extends Library.Named
@@ -191,7 +191,7 @@ object Build_System {
 
   /* SQL data model */
 
-  object private_data extends SQL.Data("isabelle_build_system") {
+  object private_data extends SQL.Data("isabelle_build_manager") {
     /* tables */
 
     override lazy val tables: SQL.Tables =
@@ -278,7 +278,7 @@ object Build_System {
         name = "pending")
     }
 
-    def pull_pending(db: SQL.Database): Build_System.State.Pending =
+    def pull_pending(db: SQL.Database): Build_Manager.State.Pending =
       db.execute_query_statement(Pending.table.select(), Map.from[String, Task], get =
         { res =>
           val kind = res.string(Pending.kind)
@@ -319,8 +319,8 @@ object Build_System {
 
     def update_pending(
       db: SQL.Database,
-      old_pending: Build_System.State.Pending,
-      pending: Build_System.State.Pending
+      old_pending: Build_Manager.State.Pending,
+      pending: Build_Manager.State.Pending
     ): Library.Update = {
       val update = Library.Update.make(old_pending, pending)
       val delete = update.delete.map(old_pending(_).id.toString)
@@ -381,7 +381,7 @@ object Build_System {
         name = "running")
     }
 
-    def pull_running(db: SQL.Database): Build_System.State.Running =
+    def pull_running(db: SQL.Database): Build_Manager.State.Running =
       db.execute_query_statement(Running.table.select(), Map.from[String, Job], get =
         { res =>
           val id = res.string(Running.id)
@@ -400,8 +400,8 @@ object Build_System {
 
     def update_running(
       db: SQL.Database,
-      old_running: Build_System.State.Running,
-      running: Build_System.State.Running
+      old_running: Build_Manager.State.Running,
+      running: Build_Manager.State.Running
     ): Library.Update = {
       val update = Library.Update.make(old_running, running)
       val delete = update.delete.map(old_running(_).id.toString)
@@ -446,9 +446,9 @@ object Build_System {
 
     def pull_finished(
       db: SQL.Database,
-      finished: Build_System.State.Finished
-    ): Build_System.State.Finished = {
-      val max_serial0 = Build_System.State.max_serial(finished.values.map(_.serial))
+      finished: Build_Manager.State.Finished
+    ): Build_Manager.State.Finished = {
+      val max_serial0 = Build_Manager.State.max_serial(finished.values.map(_.serial))
       val max_serial1 = read_finished_serial(db)
       val missing = (max_serial0 + 1) to max_serial1
       finished ++ db.execute_query_statement(
@@ -470,10 +470,10 @@ object Build_System {
 
     def push_finished(
       db: SQL.Database,
-      finished: Build_System.State.Finished
-    ): Build_System.State.Finished = {
+      finished: Build_Manager.State.Finished
+    ): Build_Manager.State.Finished = {
       val (insert0, old) = finished.partition(_._2.serial == 0L)
-      val max_serial = Build_System.State.max_serial(finished.map(_._2.serial))
+      val max_serial = Build_Manager.State.max_serial(finished.map(_._2.serial))
       val insert =
         for (((_, result), n) <- insert0.zipWithIndex)
         yield result.copy(serial = max_serial + 1 + n)
@@ -494,7 +494,7 @@ object Build_System {
   }
 
 
-  /* running build system processes */
+  /* running build manager processes */
 
   abstract class Loop_Process[A](name: String, store: Store, progress: Progress)
     extends Runnable {
@@ -509,16 +509,16 @@ object Build_System {
     protected var _state = State()
 
     protected def synchronized_database[A](label: String)(body: => A): A = synchronized {
-      Build_System.private_data.transaction_lock(_database, label = name + "." + label) {
-        val old_state = Build_System.private_data.pull_state(_database, _state)
+      Build_Manager.private_data.transaction_lock(_database, label = name + "." + label) {
+        val old_state = Build_Manager.private_data.pull_state(_database, _state)
         _state = old_state
         val res = body
-        _state = Build_System.private_data.push_state(_database, old_state, _state)
+        _state = Build_Manager.private_data.push_state(_database, old_state, _state)
         res
       }
     }
 
-    protected def delay = options.seconds("build_system_delay")
+    protected def delay = options.seconds("build_manager_delay")
 
     def init: A
     def loop_body(a: A): A
@@ -716,7 +716,7 @@ object Build_System {
     progress: Progress
   ) extends Loop_Process[(String, String)]("Poller", store, progress) {
 
-    override def delay = options.seconds("build_system_poll_delay")
+    override def delay = options.seconds("build_manager_poll_delay")
 
     val init: (String, String) = (isabelle_repository.id(), afp_repository.id())
 
@@ -924,7 +924,7 @@ object Build_System {
         } yield model
 
       def render(model: Model): XML.Body =
-        HTML.title("Isabelle Build System") :: (
+        HTML.title("Isabelle Build Manager") :: (
           model match {
             case Model.Error => HTML.text("invalid request")
             case Model.Home(state) => View.render_home(state)
@@ -1005,7 +1005,7 @@ object Build_System {
     lazy val ssh = store.open_ssh()
 
     def process(build_config: Build_Config): Bash.Process = {
-      val isabelle = Other_Isabelle(isabelle_dir, store.build_system_identifier, ssh, progress)
+      val isabelle = Other_Isabelle(isabelle_dir, store.build_manager_identifier, ssh, progress)
       isabelle.init(fresh = build_config.fresh_build, echo = true)
 
       // TODO this requires Other_Isabelle.bash / ssh.execute / ssh.run_command to give access to bash process
@@ -1037,11 +1037,11 @@ object Build_System {
   }
 
 
-  /* build system store */
+  /* build manager store */
 
   case class Store(options: Options) {
-    val base_dir = Path.explode(options.string("build_system_dir"))
-    val build_system_identifier = options.string("build_system_identifier")
+    val base_dir = Path.explode(options.string("build_manager_dir"))
+    val build_manager_identifier = options.string("build_manager_identifier")
 
     def dir(elem: T): Path = base_dir + (
       elem match {
@@ -1052,31 +1052,31 @@ object Build_System {
 
     def open_ssh(): SSH.Session =
       SSH.open_session(options,
-        host = options.string("build_system_ssh_host"),
-        port = options.int("build_system_ssh_port"),
-        user = options.string("build_system_ssh_user"))
+        host = options.string("build_manager_ssh_host"),
+        port = options.int("build_manager_ssh_port"),
+        user = options.string("build_manager_ssh_user"))
 
     def open_database(server: SSH.Server = SSH.no_server): PostgreSQL.Database =
       PostgreSQL.open_database_server(options, server = server,
-        user = options.string("build_system_database_user"),
-        password = options.string("build_system_database_password"),
-        database = options.string("build_system_database_name"),
-        host = options.string("build_system_database_host"),
-        port = options.int("build_system_database_port"),
-        ssh_host = options.string("build_system_database_ssh_host"),
-        ssh_port = options.int("build_system_database_ssh_port"),
-        ssh_user = options.string("build_system_database_ssh_user"))
+        user = options.string("build_manager_database_user"),
+        password = options.string("build_manager_database_password"),
+        database = options.string("build_manager_database_name"),
+        host = options.string("build_manager_database_host"),
+        port = options.int("build_manager_database_port"),
+        ssh_host = options.string("build_manager_database_ssh_host"),
+        ssh_port = options.int("build_manager_database_ssh_port"),
+        ssh_user = options.string("build_manager_database_ssh_user"))
 
     def open_postgresql_server(): SSH.Server =
       PostgreSQL.open_server(options,
-        host = options.string("build_system_database_host"),
-        port = options.int("build_system_database_port"),
-        ssh_host = options.string("build_system_ssh_host"),
-        ssh_port = options.int("build_system_ssh_port"),
-        ssh_user = options.string("build_system_ssh_user"))
+        host = options.string("build_manager_database_host"),
+        port = options.int("build_manager_database_port"),
+        ssh_host = options.string("build_manager_ssh_host"),
+        ssh_port = options.int("build_manager_ssh_port"),
+        ssh_user = options.string("build_manager_ssh_user"))
   }
 
-  def build_system(
+  def build_manager(
     afp_root: Option[Path],
     build_hosts: List[Build_Cluster.Host],
     options: Options,
@@ -1086,13 +1086,13 @@ object Build_System {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
     val afp_repository = Mercurial.repository(afp_root.getOrElse(AFP.BASE))
-    val ci_jobs = space_explode(',', options.string("build_system_ci_jobs"))
+    val ci_jobs = space_explode(',', options.string("build_manager_ci_jobs"))
     val paths =
-      Web_App.Paths(Url(options.string("build_system_address")), Path.current, true, Page.HOME)
+      Web_App.Paths(Url(options.string("build_manager_address")), Path.current, true, Page.HOME)
 
     using(store.open_database())(db =>
-      Build_System.private_data.transaction_lock(db,
-        create = true, label = "Build_System.build_system") {})
+      Build_Manager.private_data.transaction_lock(db,
+        create = true, label = "Build_Manager.build_manager") {})
 
     val processes = List(
       new Runner(store, build_hosts, isabelle_repository, afp_repository, progress),
@@ -1109,7 +1109,7 @@ object Build_System {
     }
   }
 
-  def submit_build(
+  def build_task(
     options: Options,
     store: Store,
     afp_root: Option[Path] = None,
@@ -1151,14 +1151,14 @@ object Build_System {
         } else {
           using(store.open_postgresql_server()) { server =>
             using(store.open_database(server = server)) { db =>
-              Build_System.private_data.transaction_lock(db, label = "Build_System.submit_build") {
-                val old_state = Build_System.private_data.pull_state(db, State())
+              Build_Manager.private_data.transaction_lock(db, label = "Build_Manager.build_task") {
+                val old_state = Build_Manager.private_data.pull_state(db, State())
                 val state = old_state.add_pending(task)
-                Build_System.private_data.push_state(db, old_state, state)
+                Build_Manager.private_data.push_state(db, old_state, state)
               }
             }
           }
-          val address = options.string("build_system_address")
+          val address = options.string("build_manager_address")
           progress.echo("Submitted task. See " + address + "/build?id=" + task.id)
         }
       }
@@ -1174,7 +1174,7 @@ object Build_System {
     val connection_options =
       for {
         option <- options.iterator
-        if option.name.startsWith("build_system") && option.for_tag(Options.TAG_CONNECTION)
+        if option.name.startsWith("build_manager") && option.for_tag(Options.TAG_CONNECTION)
       } yield option
 
     cat_lines((relevant.flatMap(options.get) ::: connection_options.toList).map(_.print))
@@ -1182,12 +1182,12 @@ object Build_System {
 
   private val relevant_server_options =
     List(
-      "build_system_delay",
-      "build_system_poll_delay",
-      "build_system_dir",
-      "build_system_identifier")
+      "build_manager_delay",
+      "build_manager_poll_delay",
+      "build_manager_dir",
+      "build_manager_identifier")
 
-  val isabelle_tool = Isabelle_Tool("build_system", "run build system", Scala_Project.here,
+  val isabelle_tool = Isabelle_Tool("build_manager", "run build manager", Scala_Project.here,
     { args =>
       var afp_root: Option[Path] = None
       val build_hosts = new mutable.ListBuffer[Build_Cluster.Host]
@@ -1195,7 +1195,7 @@ object Build_System {
       var port = 8080
 
       val getopts = Getopts("""
-Usage: isabelle build_system [OPTIONS]
+Usage: isabelle build_manager [OPTIONS]
 
   Options are:
     -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
@@ -1204,7 +1204,7 @@ Usage: isabelle build_system [OPTIONS]
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
     -p PORT      explicit web server port
 
-  Run Isabelle build system and server frontend, depending on system options:
+  Run Isabelle build manager and server frontend, depending on system options:
 """ + Library.indent_lines(2, show_relevant_options(relevant_server_options, options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "H:" -> (arg => build_hosts ++= Build_Cluster.Host.parse(Registry.global, arg)),
@@ -1216,13 +1216,13 @@ Usage: isabelle build_system [OPTIONS]
 
       val progress = new Console_Progress()
 
-      build_system(afp_root = afp_root, build_hosts = build_hosts.toList, options = options,
+      build_manager(afp_root = afp_root, build_hosts = build_hosts.toList, options = options,
         port = port, progress = progress)
     })
 
-  val relevant_client_options = List("build_system_dir")
+  val relevant_client_options = List("build_manager_dir")
 
-  val isabelle_tool1 = Isabelle_Tool("submit_build", "submit build on build system",
+  val isabelle_tool1 = Isabelle_Tool("build_task", "submit build task for build manager",
     Scala_Project.here,
     { args =>
       var afp_root: Option[Path] = None
@@ -1241,7 +1241,7 @@ Usage: isabelle build_system [OPTIONS]
       val exclude_sessions = new mutable.ListBuffer[String]
 
       val getopts = Getopts("""
-Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
+Usage: isabelle build_task [OPTIONS] [SESSIONS ...]
 
   Options are:
     -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
@@ -1280,7 +1280,7 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
       val store = Store(options)
       val progress = new Console_Progress()
 
-      submit_build(options, store = store, afp_root = afp_root, base_sessions =
+      build_task(options, store = store, afp_root = afp_root, base_sessions =
         base_sessions.toList, presentation = presentation, requirements = requirements,
         exclude_session_groups = exclude_session_groups.toList, all_sessions = all_sessions,
         build_heap = build_heap, clean_build = clean_build, export_files = export_files,
@@ -1291,5 +1291,5 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
   // TODO more Isabelle tools, e.g. to cancel builds, edit builds...
 }
 
-class Build_System_Tools extends Isabelle_Scala_Tools(
-  Build_System.isabelle_tool, Build_System.isabelle_tool1)
+class Build_Manager_Tools extends Isabelle_Scala_Tools(
+  Build_Manager.isabelle_tool, Build_Manager.isabelle_tool1)

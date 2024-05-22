@@ -1,4 +1,4 @@
-# Isabelle Build System
+# Isabelle Build Manager
 
 ## Installation
 
@@ -10,18 +10,18 @@
 
 In your `~/.isabelle/etc/preferences`, set your ssh user to the Isabelle system (same user as for
 repository access):
-`build_system_ssh_user = "..."`
-Then you can submit builds with `isabelle submit_build <...>`, where `<...>` are (most of) the
+`build_manager_ssh_user = "..."`
+Then you can submit build tasks with `isabelle build_task <...>`, where `<...>` are (most of) the
 regular Isabelle build options, e.g.:
 ```
-isabelle submit_build -P HOL-Analysis
+isabelle build_task -P HOL-Analysis
 ```
 
 ## Development
 
 ### Starting server:
 
-`isabelle build_system`
+`isabelle build_manager`
 
 ### IDE Setup
 
