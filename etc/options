@@ -2,29 +2,30 @@
 
 section "Build Manager"
 
-option build_manager_delay : real = 1.0
-  -- "delay build manager loop"
-
-option build_manager_poll_delay : real = 60.0
-  -- "delay build manager poll loop"
-
 option build_manager_dir : string = "/srv/build"
   -- "directory for submissions on build server"
 
+option build_manager_address : string = "https://build.proof.cit.tum.de"
+  -- "web address for build server"
+
 option build_manager_identifier : string = "build_manager"
   -- "isabelle identifier for build manager processes"
-  
+
+option build_manager_delay : real = 1.0
+  -- "delay build manager loop"
+option build_manager_poll_delay : real = 60.0
+  -- "delay build manager poll loop"
+
 option build_manager_ci_jobs : string = "benchmark"
   -- "ci jobs that should be executed on repository changes"
 
-option build_manager_address : string = "https://build.proof.cit.tum.de"
-  -- "web address for build server"
 
 section "Build Manager SSH"
 
 option build_manager_ssh_host : string = "build.proof.cit.tum.de" for connection
 option build_manager_ssh_user : string = "" for connection
 option build_manager_ssh_port : int = 0 for connection
+
 
 section "Build Manager Database"
 
