@@ -957,7 +957,8 @@ object Build_Manager {
     def apply(store: Store, elem: T, build_hosts: List[Build_Cluster.Host] = Nil): Context = {
       val afp =
         elem match {
-          case Task(_, _, _, _, _, Some(_)) | Job(_, _, _, _, Some(_), _, _) => true
+          case task: Task if task.afp_version.isDefined => true
+          case job: Job if job.afp_version.isDefined => true
           case _ => false
         }
         
