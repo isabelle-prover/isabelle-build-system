@@ -964,11 +964,6 @@ object Build_Manager {
         
       new Context(store, store.dir(elem), afp, build_hosts)
     }
-
-    def apply(store: Store, job: Job): Context =
-      new Context(store, store.dir(job), job.afp_version.isDefined)
-
-    def apply(store: Store, result: Result): Context = new Context(store, store.dir(result))
   }
 
   class Context private(
