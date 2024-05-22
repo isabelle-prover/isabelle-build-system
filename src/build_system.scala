@@ -521,16 +521,19 @@ object Build_System {
     protected def delay = options.seconds("build_system_delay")
 
     def init: A
-    def iterate(a: A): A
+    def loop_body(a: A): A
     def stopped(a: A): Boolean = progress.stopped
 
-    def sleep(time: Time): Unit = synchronized { wait(time.ms) }
-    def stop(): Unit = synchronized { notify() }
+    private val stopped = Synchronized(false)
+    private def sleep(time: Time): Unit =
+      stopped.timed_access(_ => Some(Time.now() + time), b => if (b) Some((), false) else None)
+
+    def stop(): Unit = stopped.change(_ => true)
 
     @tailrec private def loop(a: A): Unit =
       if (!stopped(a)) {
         val start = Date.now()
-        val a1 = iterate(a)
+        val a1 = loop_body(a)
         if (!stopped(a)) {
           val elapsed = Date.now() - start
           if (elapsed < delay) sleep(delay - elapsed)
@@ -686,7 +689,7 @@ object Build_System {
     override def stopped(state: Runner.State): Boolean = progress.stopped && state.is_empty
 
     def init: Runner.State = Runner.State.empty
-    def iterate(state: Runner.State): Runner.State = {
+    def loop_body(state: Runner.State): Runner.State = {
       if (state.is_empty && !progress.stopped) {
         start_next() match {
           case None => state
@@ -726,7 +729,7 @@ object Build_System {
       }
     }
 
-    def iterate(ids: (String, String)): (String, String) =
+    def loop_body(ids: (String, String)): (String, String) =
       Exn.capture {
         isabelle_repository.synchronized(isabelle_repository.pull())
         afp_repository.synchronized(afp_repository.pull())
@@ -941,7 +944,7 @@ object Build_System {
     }
 
     def init: Unit = server.start()
-    def iterate(u: Unit): Unit = {
+    def loop_body(u: Unit): Unit = {
       if (progress.stopped) server.stop()
       else synchronized_database("iterate") { }
     }
@@ -1096,7 +1099,7 @@ object Build_System {
       new Poller(ci_jobs, store, isabelle_repository, afp_repository, progress),
       new Web_Server(port, paths, store, progress))
 
-    val threads = processes.map(new Thread(_))
+    val threads = processes.map(Isabelle_Thread.create(_))
     POSIX_Interrupt.handler {
       progress.stop()
       processes.foreach(_.stop())
@@ -1245,7 +1248,6 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
     -B NAME      include session NAME and all descendants
     -P           enable HTML/PDF presentation
     -R           refer to requirements of selected sessions
-    -S           soft build: only observe changes of sources, not heap images
     -X NAME      exclude sessions from group NAME and all descendants
     -a           select all sessions
     -b           build heap images
@@ -1253,12 +1255,8 @@ Usage: isabelle submit_build [OPTIONS] [SESSIONS ...]
     -e           export files from session specification into file-system
     -f           fresh build
     -g NAME      select session group NAME
-    -k KEYWORD   check theory sources for conflicts with proposed keywords
-    -l           list session source files
-    -n           no build -- take existing session build databases
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
     -p OPTIONS   comma-separated preferences for build process
-    -v           verbose
     -x NAME      exclude session NAME and all descendants
 
   Submit build on SSH server, depending on system options:
