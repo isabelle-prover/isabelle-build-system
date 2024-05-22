@@ -1192,7 +1192,7 @@ object Build_System {
       var afp_root: Option[Path] = None
       val build_hosts = new mutable.ListBuffer[Build_Cluster.Host]
       var options = Options.init()
-      var port = 443
+      var port = 8080
 
       val getopts = Getopts("""
 Usage: isabelle build_system [OPTIONS]
