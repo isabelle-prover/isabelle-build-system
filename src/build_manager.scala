@@ -148,7 +148,7 @@ object Build_Manager {
     def add_pending(task: Task): State = copy(pending = pending + (task.name -> task))
     def remove_pending(name: String): State = copy(pending = pending - name)
 
-    def size = pending.size + running.size + finished.size
+    def num_builds = running.size + finished.size
 
     def next: List[Task] =
       if (pending.isEmpty) Nil
@@ -287,7 +287,7 @@ object Build_Manager {
           val isabelle_version = Version.parse(res.string(Pending.isabelle_version))
           val afp_version = res.get_string(Pending.afp_version).map(Version.parse)
 
-          val build_config = 
+          val build_config =
             if (kind != User_Build.name) CI_Build(kind)
             else {
               val prefs = Options.Spec.parse(res.string(Pending.prefs))
@@ -338,12 +338,12 @@ object Build_Manager {
             stmt.string(5) = task.isabelle_version.toString
             stmt.string(6) = task.afp_version.map(_.toString)
 
-            def get[A](f: User_Build => A): Option[A] = 
+            def get[A](f: User_Build => A): Option[A] =
               task.build_config match {
                 case user_build: User_Build => Some(f(user_build))
                 case _ => None
               }
-            
+
             stmt.string(7) = get(user_build => Options.Spec.bash_strings(user_build.prefs))
             stmt.bool(8) = get(_.requirements)
             stmt.bool(9) = get(_.all_sessions)
@@ -827,7 +827,7 @@ object Build_Manager {
 
         chapter("Dashboard") ::
           text("Queue: " + state.pending.size + " tasks waiting") :::
-          section("Builds") :: text("Total: " + state.size + " builds") :::
+          section("Builds") :: text("Total: " + state.num_builds + " builds") :::
           state.kinds.map(render_kind)
       }
 
