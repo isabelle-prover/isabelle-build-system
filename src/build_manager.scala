@@ -43,7 +43,6 @@ object Build_Manager {
     def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String =
       " build -g timing"
     // TODO ci_build requires synced intact hg repository
-    // TODO afp requires more sync: scala components need to be present as well
     def fresh_build: Boolean = true
   }
 
@@ -1002,7 +1001,9 @@ object Build_Manager {
 
     def process(build_config: Build_Config): Bash.Process = {
       val isabelle = Other_Isabelle(isabelle_dir, store.build_manager_identifier, ssh, progress)
-      isabelle.init(fresh = build_config.fresh_build, echo = true)
+      val afp_settings = afp_path.map(path => "init_component " + quote(path.implode))
+      isabelle.init(other_settings = isabelle.init_components() ::: afp_settings.toList,
+        fresh = build_config.fresh_build, echo = true)
 
       // TODO this requires Other_Isabelle.bash / ssh.execute / ssh.run_command to give access to bash process
       val cmd = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) +
@@ -1139,7 +1140,7 @@ object Build_Manager {
         val rsync_context = Rsync.Context(ssh = ssh)
         progress.echo("Transferring repositories...")
         Sync.sync(store.options, rsync_context, context.isabelle_dir, preserve_jars = true,
-          afp_root = afp_root)
+          dirs = Sync.afp_dirs(afp_root))
         ssh.execute("chmod -R ga+rwx " + context.dir)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
