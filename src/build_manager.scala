@@ -523,19 +523,17 @@ object Build_Manager {
     def loop_body(a: A): A
     def stopped(a: A): Boolean = progress.stopped
 
-    private val stopped = Synchronized(false)
-    private def sleep(time: Time): Unit =
-      stopped.timed_access(_ => Some(Time.now() + time), b => if (b) Some((), false) else None)
-
-    def stop(): Unit = stopped.change(_ => true)
+    private val interrupted = Synchronized(false)
+    private def sleep(time_limit: Time): Unit =
+      interrupted.timed_access(_ => Some(time_limit), b => if (b) Some((), false) else None)
+    def interrupt(): Unit = interrupted.change(_ => true)
 
     @tailrec private def loop(a: A): Unit =
       if (!stopped(a)) {
-        val start = Date.now()
+        val start = Time.now()
         val a1 = loop_body(a)
         if (!stopped(a)) {
-          val elapsed = Date.now() - start
-          if (elapsed < delay) sleep(delay - elapsed)
+          sleep(start + delay)
           loop(a1)
         }
       }
@@ -960,7 +958,7 @@ object Build_Manager {
           case job: Job if job.afp_version.isDefined => true
           case _ => false
         }
-        
+
       new Context(store, store.dir(elem), afp, build_hosts)
     }
   }
@@ -1099,7 +1097,7 @@ object Build_Manager {
     val threads = processes.map(Isabelle_Thread.create(_))
     POSIX_Interrupt.handler {
       progress.stop()
-      processes.foreach(_.stop())
+      processes.foreach(_.interrupt())
     } {
       threads.foreach(_.start())
       threads.foreach(_.join())
