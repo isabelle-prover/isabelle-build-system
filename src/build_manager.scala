@@ -705,20 +705,30 @@ object Build_Manager {
 
   /* repository poller */
 
+  object Poller {
+    case class State(ids: (String, String), next: Future[(String, String)])
+  }
+
   class Poller(
     ci_jobs: List[String],
     store: Store,
     isabelle_repository: Mercurial.Repository,
     afp_repository: Mercurial.Repository,
     progress: Progress
-  ) extends Loop_Process[(String, String)]("Poller", store, progress) {
+  ) extends Loop_Process[Poller.State]("Poller", store, progress) {
 
     override def delay = options.seconds("build_manager_poll_delay")
 
-    val init: (String, String) = (isabelle_repository.id(), afp_repository.id())
+    val init: Poller.State = Poller.State((isabelle_repository.id(), afp_repository.id()), poll)
 
     def ci_task(name: String): Task =
       Task(CI_Build(name), priority = Priority.low, afp_version = Some(Version.Latest))
+
+    private def poll: Future[(String, String)] = Future.fork {
+      isabelle_repository.synchronized(isabelle_repository.pull())
+      afp_repository.synchronized(afp_repository.pull())
+      (isabelle_repository.id(), afp_repository.id())
+    }
 
     private def add_task(): Unit = synchronized_database("add_task") {
       for (name <- ci_jobs if !_state.pending.values.exists(_.kind == name)) {
@@ -726,21 +736,20 @@ object Build_Manager {
       }
     }
 
-    def loop_body(ids: (String, String)): (String, String) =
-      Exn.capture {
-        isabelle_repository.synchronized(isabelle_repository.pull())
-        afp_repository.synchronized(afp_repository.pull())
-        (isabelle_repository.id(), afp_repository.id())
-      } match {
-        case Exn.Exn(exn) =>
-          echo_error_message("Could not reach repository: " + exn.getMessage)
-          ids
-        case Exn.Res(ids1) =>
-          if (ids != ids1) {
-            echo("Found new revisions: " + ids1)
-            add_task()
-          }
-          ids1
+    def loop_body(state: Poller.State): Poller.State =
+      if (!state.next.is_finished) state
+      else {
+        state.next.join_result match {
+          case Exn.Exn(exn) =>
+            echo_error_message("Could not reach repository: " + exn.getMessage)
+            Poller.State(state.ids, poll)
+          case Exn.Res(ids1) =>
+            if (state.ids != ids1) {
+              echo("Found new revisions: " + ids1)
+              add_task()
+            }
+            Poller.State(ids1, poll)
+        }
       }
   }
 
@@ -758,7 +767,6 @@ object Build_Manager {
     val CSS = Path.explode("api/isabelle.css")
   }
 
-  // TODO: allow HEAD request for post endpoints, to enable reloading via live.js
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
     extends Loop_Process[Unit]("Web_Server", store, progress) {
     import Web_App.*
