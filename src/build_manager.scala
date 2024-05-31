@@ -604,6 +604,8 @@ object Build_Manager {
     private def start_next(): Option[(Build_Config, Job)] =
       synchronized_database("start_job") {
         _state.next.headOption.flatMap { task =>
+          progress.echo("Initializing " + task.name)
+
           _state = _state.remove_pending(task.name)
 
           val context = Context(store, task, build_hosts)
