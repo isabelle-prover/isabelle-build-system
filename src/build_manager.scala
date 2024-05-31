@@ -839,14 +839,21 @@ object Build_Manager {
             submit_form("", List(hidden(ID, id.toString),
               api_button(paths.api_route(API.BUILD_CANCEL), "cancel build")))))
 
+        def render_rev(isabelle_rev: String, afp_rev: Option[String]): XML.Body =
+          par(text("Isabelle/" + isabelle_rev)) ::
+          afp_rev.toList.map(rev => par(text("AFP/" + rev)))
+
         chapter("Build " + elem.name) :: (elem match {
           case task: Task =>
-            par(text("Task from " + task.submit_date + ". ")) :: render_cancel(task.id)
+            par(text("Task from " + task.submit_date + ". ")) ::
+            render_rev(task.isabelle_rev, task.afp_rev) :::
+            render_cancel(task.id)
           case job: Job =>
             par(text("Start: " + job.start_date)) ::
             par(
               if (job.cancelled) text("Cancelling...")
               else text("Running...") ::: render_cancel(job.id)) ::
+            render_rev(job.isabelle_rev, job.afp_rev) :::
             source(Context(store, job).log) :: Nil
           case result: Result =>
             par(text("Date: " + result.date)) ::
