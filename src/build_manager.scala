@@ -17,22 +17,6 @@ object Build_Manager {
 
   enum Priority { case low, normal, high }
 
-  object Version {
-    val Rev = """Revision\((.*)\)""".r
-
-    def parse(s: String): Version =
-      List(Latest, Local).find(_.toString == s).getOrElse(s match {
-        case Rev(rev) => Revision(rev)
-        case _ => error("Invalid version: " + quote(s))
-      })
-  }
-
-  enum Version {
-    case Latest extends Version
-    case Local extends Version
-    case Revision(rev: String = "") extends Version
-  }
-
   sealed trait Build_Config {
     def name: String
     def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String
@@ -89,8 +73,8 @@ object Build_Manager {
     id: UUID.T = UUID.random(),
     submit_date: Date = Date.now(),
     priority: Priority = Priority.normal,
-    isabelle_version: Version = Version.Latest,
-    afp_version: Option[Version] = None,
+    isabelle_rev: String = "tip",
+    afp_rev: Option[String] = None,
   ) extends T {
     def name: String = id.toString
     def kind: String = build_config.name
@@ -100,8 +84,8 @@ object Build_Manager {
     id: UUID.T,
     kind: String,
     number: Long,
-    isabelle_version: String,
-    afp_version: Option[String],
+    isabelle_rev: String,
+    afp_rev: Option[String],
     start_date: Date = Date.now(),
     cancelled: Boolean = false
   ) extends T { def name: String = kind + "/" + number }
@@ -252,8 +236,8 @@ object Build_Manager {
       val id = SQL.Column.string("id").make_primary_key
       val submit_date = SQL.Column.date("submit_date")
       val priority = SQL.Column.string("priority")
-      val isabelle_version = SQL.Column.string("isabelle_version")
-      val afp_version = SQL.Column.string("afp_version")
+      val isabelle_rev = SQL.Column.string("isabelle_rev")
+      val afp_rev = SQL.Column.string("afp_rev")
 
       val prefs = SQL.Column.string("prefs")
       val requirements = SQL.Column.bool("requirements")
@@ -270,7 +254,7 @@ object Build_Manager {
       val presentation = SQL.Column.bool("presentation")
 
       val table =
-        make_table(List(kind, id, submit_date, priority, isabelle_version, afp_version, prefs,
+        make_table(List(kind, id, submit_date, priority, isabelle_rev, afp_rev, prefs,
           requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
           session_groups, sessions, build_heap, clean_build, export_files, fresh_build,
           presentation),
@@ -284,8 +268,8 @@ object Build_Manager {
           val id = res.string(Pending.id)
           val submit_date = res.date(Pending.submit_date)
           val priority = Priority.valueOf(res.string(Pending.priority))
-          val isabelle_version = Version.parse(res.string(Pending.isabelle_version))
-          val afp_version = res.get_string(Pending.afp_version).map(Version.parse)
+          val isabelle_rev = res.string(Pending.isabelle_rev)
+          val afp_rev = res.get_string(Pending.afp_rev)
 
           val build_config =
             if (kind != User_Build.name) CI_Build(kind)
@@ -311,7 +295,7 @@ object Build_Manager {
             }
 
           val task =
-            Task(build_config, UUID.make(id), submit_date, priority, isabelle_version, afp_version)
+            Task(build_config, UUID.make(id), submit_date, priority, isabelle_rev, afp_rev)
 
           task.name -> task
         })
@@ -335,8 +319,8 @@ object Build_Manager {
             stmt.string(2) = task.id.toString
             stmt.date(3) = task.submit_date
             stmt.string(4) = task.priority.toString
-            stmt.string(5) = task.isabelle_version.toString
-            stmt.string(6) = task.afp_version.map(_.toString)
+            stmt.string(5) = task.isabelle_rev
+            stmt.string(6) = task.afp_rev
 
             def get[A](f: User_Build => A): Option[A] =
               task.build_config match {
@@ -370,13 +354,13 @@ object Build_Manager {
       val id = SQL.Column.string("id").make_primary_key
       val kind = SQL.Column.string("kind")
       val number = SQL.Column.long("number")
-      val isabelle_version = SQL.Column.string("isabelle_version")
-      val afp_version = SQL.Column.string("afp_option")
+      val isabelle_rev = SQL.Column.string("isabelle_rev")
+      val afp_rev = SQL.Column.string("afp_rev")
       val start_date = SQL.Column.date("start_date")
       val cancelled = SQL.Column.bool("cancelled")
 
       val table =
-        make_table(List(id, kind, number, isabelle_version, afp_version, start_date, cancelled),
+        make_table(List(id, kind, number, isabelle_rev, afp_rev, start_date, cancelled),
         name = "running")
     }
 
@@ -386,13 +370,12 @@ object Build_Manager {
           val id = res.string(Running.id)
           val kind = res.string(Running.kind)
           val number = res.long(Running.number)
-          val isabelle_version = res.string(Running.isabelle_version)
-          val afp_version = res.get_string(Running.afp_version)
+          val isabelle_rev = res.string(Running.isabelle_rev)
+          val afp_rev = res.get_string(Running.afp_rev)
           val start_date = res.date(Running.start_date)
           val cancelled = res.bool(Running.cancelled)
 
-          val job =
-            Job(UUID.make(id), kind, number, isabelle_version, afp_version, start_date, cancelled)
+          val job = Job(UUID.make(id), kind, number, isabelle_rev, afp_rev, start_date, cancelled)
 
           job.name -> job
         })
@@ -415,8 +398,8 @@ object Build_Manager {
             stmt.string(1) = job.id.toString
             stmt.string(2) = job.kind
             stmt.long(3) = job.number
-            stmt.string(4) = job.isabelle_version
-            stmt.string(5) = job.afp_version
+            stmt.string(4) = job.isabelle_rev
+            stmt.string(5) = job.afp_rev
             stmt.date(6) = job.start_date
             stmt.bool(7) = job.cancelled
           })
@@ -607,14 +590,10 @@ object Build_Manager {
   ) extends Loop_Process[Runner.State]("Runner", store, progress) {
     val rsync_context = Rsync.Context()
 
-    private def sync(repository: Mercurial.Repository, version: Version, target: Path): String = {
+    private def sync(repository: Mercurial.Repository, rev: String, target: Path): String = {
       repository.synchronized { repository.pull() }
 
-      version match {
-        case Version.Local =>
-        case Version.Latest => repository.sync(rsync_context, target, rev = "tip")
-        case Version.Revision(rev) => repository.sync(rsync_context, target, rev = rev)
-      }
+      if (rev.nonEmpty) repository.sync(rsync_context, target, rev = rev)
 
       Exn.capture(repository.id(Mercurial.repository(target).id())) match {
         case Exn.Res(res) => res
@@ -631,11 +610,11 @@ object Build_Manager {
           val number = _state.next_number(task.kind)
 
           Exn.capture {
-            val isabelle_version =
-              sync(isabelle_repository, task.isabelle_version, context.isabelle_dir)
-            val afp_version = task.afp_version.map(sync(afp_repository, _, context.afp_dir))
+            val isabelle_rev =
+              sync(isabelle_repository, task.isabelle_rev, context.isabelle_dir)
+            val afp_rev = task.afp_rev.map(sync(afp_repository, _, context.afp_dir))
 
-            Job(task.id, task.kind, number, isabelle_version, afp_version)
+            Job(task.id, task.kind, number, isabelle_rev, afp_rev)
           } match {
             case Exn.Res(job) =>
               _state = _state.add_running(job)
@@ -722,7 +701,7 @@ object Build_Manager {
     val init: Poller.State = Poller.State((isabelle_repository.id(), afp_repository.id()), poll)
 
     def ci_task(name: String): Task =
-      Task(CI_Build(name), priority = Priority.low, afp_version = Some(Version.Latest))
+      Task(CI_Build(name), priority = Priority.low, afp_rev = Some("tip"))
 
     private def poll: Future[(String, String)] = Future.fork {
       isabelle_repository.synchronized(isabelle_repository.pull())
@@ -962,8 +941,8 @@ object Build_Manager {
     def apply(store: Store, elem: T, build_hosts: List[Build_Cluster.Host] = Nil): Context = {
       val afp =
         elem match {
-          case task: Task if task.afp_version.isDefined => true
-          case job: Job if job.afp_version.isDefined => true
+          case task: Task if task.afp_rev.isDefined => true
+          case job: Job if job.afp_rev.isDefined => true
           case _ => false
         }
 
@@ -1132,12 +1111,12 @@ object Build_Manager {
     progress: Progress = new Progress
   ): UUID.T = {
     val id = UUID.random()
-    val afp_version = if (afp_root.nonEmpty) Some(Version.Local) else None
+    val afp_rev = if (afp_root.nonEmpty) Some("") else None
 
     val build_config = User_Build(prefs, requirements, all_sessions, base_sessions,
       exclude_session_groups, exclude_sessions, session_groups, sessions, build_heap, clean_build,
       export_files, fresh_build, presentation)
-    val task = Task(build_config, id, Date.now(), Priority.high, Version.Local, afp_version)
+    val task = Task(build_config, id, Date.now(), Priority.high, "", afp_rev)
 
     val context = Context(store, task)
 
