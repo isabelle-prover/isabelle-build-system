@@ -13,20 +13,33 @@ import scala.annotation.tailrec
 object Build_Manager {
   /* task state synchronized via db */
 
+  object Component {
+    def parse(s: String): Component =
+      space_explode('/', s) match {
+        case name :: rev :: Nil => Component(name, rev)
+        case _ => error("Malformed component: " + quote(s))
+      }
+
+    def AFP(rev: String = "") = Component("AFP", rev)
+  }
+
+  case class Component(name: String, rev: String = "") {
+    override def toString: String = name + "/" + rev
+  }
+
   sealed trait T extends Library.Named
 
   enum Priority { case low, normal, high }
 
   sealed trait Build_Config {
     def name: String
-    def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String
+    def command(build_hosts: List[Build_Cluster.Host]): String
     def fresh_build: Boolean
+    def components: List[Component]
   }
 
-  case class CI_Build(name: String) extends Build_Config {
-    def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String =
-      " build -g timing"
-    // TODO ci_build requires synced intact hg repository
+  case class CI_Build(name: String, components: List[Component]) extends Build_Config {
+    def command(build_hosts: List[Build_Cluster.Host]): String = " " + name
     def fresh_build: Boolean = true
   }
 
@@ -35,6 +48,7 @@ object Build_Manager {
   }
   
   case class User_Build(
+    afp_rev: Option[String] = None,
     prefs: List[Options.Spec] = Nil,
     requirements: Boolean = false,
     all_sessions: Boolean = false,
@@ -50,11 +64,11 @@ object Build_Manager {
     presentation: Boolean = false
   ) extends Build_Config {
     def name: String = User_Build.name
-    def command(afp_root: Option[Path], build_hosts: List[Build_Cluster.Host]): String = {
+    def command(build_hosts: List[Build_Cluster.Host]): String = {
       " build" +
-        if_proper(afp_root, " -A " + File.bash_path(afp_root.get)) +
+        if_proper(afp_rev, " -A:") +
         base_sessions.map(session => " -B " + Bash.string(session)).mkString +
-        /* TODO this needs Sync.sync to sync repository as well build_hosts.map(host => " -H " + Bash.string(host.print)).mkString + */
+        if_proper(build_hosts, build_hosts.map(host => " -H " + Bash.string(host.print)).mkString) +
         if_proper(presentation, " -P:") +
         if_proper(requirements, " -R") +
         if_proper(all_sessions, " -a") +
@@ -66,6 +80,7 @@ object Build_Manager {
         " -v" +
         sessions.map(session => " " + Bash.string(session)).mkString
     }
+    def components: List[Component] = afp_rev.map(Component.AFP).toList
   }
 
   sealed case class Task(
@@ -73,11 +88,11 @@ object Build_Manager {
     id: UUID.T = UUID.random(),
     submit_date: Date = Date.now(),
     priority: Priority = Priority.normal,
-    isabelle_rev: String = "tip",
-    afp_rev: Option[String] = None,
+    isabelle_rev: String = ""
   ) extends T {
     def name: String = id.toString
     def kind: String = build_config.name
+    def components: List[Component] = build_config.components
   }
 
   sealed case class Job(
@@ -85,7 +100,7 @@ object Build_Manager {
     kind: String,
     number: Long,
     isabelle_rev: String,
-    afp_rev: Option[String],
+    components: List[Component],
     start_date: Date = Date.now(),
     cancelled: Boolean = false
   ) extends T { def name: String = kind + "/" + number }
@@ -237,7 +252,7 @@ object Build_Manager {
       val submit_date = SQL.Column.date("submit_date")
       val priority = SQL.Column.string("priority")
       val isabelle_rev = SQL.Column.string("isabelle_rev")
-      val afp_rev = SQL.Column.string("afp_rev")
+      val components = SQL.Column.string("components")
 
       val prefs = SQL.Column.string("prefs")
       val requirements = SQL.Column.bool("requirements")
@@ -254,7 +269,7 @@ object Build_Manager {
       val presentation = SQL.Column.bool("presentation")
 
       val table =
-        make_table(List(kind, id, submit_date, priority, isabelle_rev, afp_rev, prefs,
+        make_table(List(kind, id, submit_date, priority, isabelle_rev, components, prefs,
           requirements, all_sessions, base_sessions, exclude_session_groups, exclude_sessions,
           session_groups, sessions, build_heap, clean_build, export_files, fresh_build,
           presentation),
@@ -269,10 +284,10 @@ object Build_Manager {
           val submit_date = res.date(Pending.submit_date)
           val priority = Priority.valueOf(res.string(Pending.priority))
           val isabelle_rev = res.string(Pending.isabelle_rev)
-          val afp_rev = res.get_string(Pending.afp_rev)
+          val components = space_explode(',', res.string(Pending.components)).map(Component.parse)
 
           val build_config =
-            if (kind != User_Build.name) CI_Build(kind)
+            if (kind != User_Build.name) CI_Build(kind, components)
             else {
               val prefs = Options.Spec.parse(res.string(Pending.prefs))
               val requirements = res.bool(Pending.requirements)
@@ -289,13 +304,13 @@ object Build_Manager {
               val fresh_build = res.bool(Pending.fresh_build)
               val presentation = res.bool(Pending.presentation)
 
-              User_Build(prefs, requirements, all_sessions, base_sessions, exclude_session_groups,
-                exclude_sessions, session_groups, sessions, build_heap, clean_build, export_files,
-                fresh_build, presentation)
+              val afp_rev = components.find(_.name == Component.AFP().name).map(_.rev)
+              User_Build(afp_rev, prefs, requirements, all_sessions, base_sessions,
+                exclude_session_groups, exclude_sessions, session_groups, sessions, build_heap,
+                clean_build, export_files, fresh_build, presentation)
             }
 
-          val task =
-            Task(build_config, UUID.make(id), submit_date, priority, isabelle_rev, afp_rev)
+          val task = Task(build_config, UUID.make(id), submit_date, priority, isabelle_rev)
 
           task.name -> task
         })
@@ -320,7 +335,7 @@ object Build_Manager {
             stmt.date(3) = task.submit_date
             stmt.string(4) = task.priority.toString
             stmt.string(5) = task.isabelle_rev
-            stmt.string(6) = task.afp_rev
+            stmt.string(6) = task.components.mkString(",")
 
             def get[A](f: User_Build => A): Option[A] =
               task.build_config match {
@@ -355,12 +370,12 @@ object Build_Manager {
       val kind = SQL.Column.string("kind")
       val number = SQL.Column.long("number")
       val isabelle_rev = SQL.Column.string("isabelle_rev")
-      val afp_rev = SQL.Column.string("afp_rev")
+      val components = SQL.Column.string("components")
       val start_date = SQL.Column.date("start_date")
       val cancelled = SQL.Column.bool("cancelled")
 
       val table =
-        make_table(List(id, kind, number, isabelle_rev, afp_rev, start_date, cancelled),
+        make_table(List(id, kind, number, isabelle_rev, components, start_date, cancelled),
         name = "running")
     }
 
@@ -371,11 +386,12 @@ object Build_Manager {
           val kind = res.string(Running.kind)
           val number = res.long(Running.number)
           val isabelle_rev = res.string(Running.isabelle_rev)
-          val afp_rev = res.get_string(Running.afp_rev)
+          val components = space_explode(',', res.string(Running.components)).map(Component.parse)
           val start_date = res.date(Running.start_date)
           val cancelled = res.bool(Running.cancelled)
 
-          val job = Job(UUID.make(id), kind, number, isabelle_rev, afp_rev, start_date, cancelled)
+          val job =
+            Job(UUID.make(id), kind, number, isabelle_rev, components, start_date, cancelled)
 
           job.name -> job
         })
@@ -399,7 +415,7 @@ object Build_Manager {
             stmt.string(2) = job.kind
             stmt.long(3) = job.number
             stmt.string(4) = job.isabelle_rev
-            stmt.string(5) = job.afp_rev
+            stmt.string(5) = job.components.mkString(",")
             stmt.date(6) = job.start_date
             stmt.bool(7) = job.cancelled
           })
@@ -585,19 +601,19 @@ object Build_Manager {
     store: Store,
     build_hosts: List[Build_Cluster.Host],
     isabelle_repository: Mercurial.Repository,
-    afp_repository: Mercurial.Repository,
+    sync_dirs: List[Sync.Dir],
     progress: Progress
   ) extends Loop_Process[Runner.State]("Runner", store, progress) {
     val rsync_context = Rsync.Context()
 
     private def sync(repository: Mercurial.Repository, rev: String, target: Path): String = {
-      repository.synchronized { repository.pull() }
+      repository.pull()
 
       if (rev.nonEmpty) repository.sync(rsync_context, target, rev = rev)
 
-      Exn.capture(repository.id(Mercurial.repository(target).id())) match {
+      Exn.capture(repository.id(File.read(target + Mercurial.Hg_Sync.PATH_ID))) match {
         case Exn.Res(res) => res
-        case Exn.Exn(exn) => "local"
+        case Exn.Exn(exn) => ""
       }
     }
 
@@ -614,9 +630,19 @@ object Build_Manager {
           Exn.capture {
             val isabelle_rev =
               sync(isabelle_repository, task.isabelle_rev, context.isabelle_dir)
-            val afp_rev = task.afp_rev.map(sync(afp_repository, _, context.afp_dir))
 
-            Job(task.id, task.kind, number, isabelle_rev, afp_rev)
+            val components =
+              for (component <- task.components)
+              yield sync_dirs.find(_.name == component.name) match {
+                case Some(sync_dir) =>
+                  val target = context.isabelle_dir + sync_dir.target
+                  component.copy(rev = sync(sync_dir.hg, component.rev, target))
+                case None =>
+                  if (component.rev.isEmpty) component
+                  else error("Unknown component " + component)
+              }
+
+            Job(task.id, task.kind, number, isabelle_rev, components)
           } match {
             case Exn.Res(job) =>
               _state = _state.add_running(job)
@@ -687,28 +713,31 @@ object Build_Manager {
   /* repository poller */
 
   object Poller {
-    case class State(ids: (String, String), next: Future[(String, String)])
+    case class State(ids: List[String], next: Future[List[String]])
   }
 
   class Poller(
     ci_jobs: List[String],
     store: Store,
     isabelle_repository: Mercurial.Repository,
-    afp_repository: Mercurial.Repository,
+    sync_dirs: List[Sync.Dir],
     progress: Progress
   ) extends Loop_Process[Poller.State]("Poller", store, progress) {
 
     override def delay = options.seconds("build_manager_poll_delay")
 
-    val init: Poller.State = Poller.State((isabelle_repository.id(), afp_repository.id()), poll)
+    private def ids: List[String] = isabelle_repository.id() :: sync_dirs.map(_.hg.id())
+    val init: Poller.State = Poller.State(ids, poll)
 
     def ci_task(name: String): Task =
-      Task(CI_Build(name), priority = Priority.low, afp_rev = Some("tip"))
+      Task(CI_Build(name, sync_dirs.map(dir => Component(dir.name, "tip"))),
+        priority = Priority.low, isabelle_rev = "tip")
 
-    private def poll: Future[(String, String)] = Future.fork {
-      isabelle_repository.synchronized(isabelle_repository.pull())
-      afp_repository.synchronized(afp_repository.pull())
-      (isabelle_repository.id(), afp_repository.id())
+    private def poll: Future[List[String]] = Future.fork {
+      Par_List.map((repo: Mercurial.Repository) => repo.pull(),
+        isabelle_repository :: sync_dirs.map(_.hg))
+
+      ids
     }
 
     private def add_task(): Unit = synchronized_database("add_task") {
@@ -841,21 +870,23 @@ object Build_Manager {
             submit_form("", List(hidden(ID, id.toString),
               api_button(paths.api_route(API.BUILD_CANCEL), "cancel build")))))
 
-        def render_rev(isabelle_rev: String, afp_rev: Option[String]): XML.Body =
-          par(text("Isabelle/" + isabelle_rev)) ::
-          afp_rev.toList.map(rev => par(text("AFP/" + rev)))
+        def render_rev(isabelle_rev: String, components: List[Component]): XML.Body =
+          for {
+            component <- Component("Isabelle", isabelle_rev) :: components
+            if component.rev.nonEmpty
+          } yield par(text(component.toString))
 
         chapter("Build " + elem.name) :: (elem match {
           case task: Task =>
             par(text("Task from " + task.submit_date + ". ")) ::
-            render_rev(task.isabelle_rev, task.afp_rev) :::
+            render_rev(task.isabelle_rev, task.components) :::
             render_cancel(task.id)
           case job: Job =>
             par(text("Start: " + job.start_date)) ::
             par(
               if (job.cancelled) text("Cancelling...")
               else text("Running...") ::: render_cancel(job.id)) ::
-            render_rev(job.isabelle_rev, job.afp_rev) :::
+            render_rev(job.isabelle_rev, job.components) :::
             source(Context(store, job).log) :: Nil
           case result: Result =>
             par(text("Date: " + result.date)) ::
@@ -947,27 +978,12 @@ object Build_Manager {
   /* context */
 
   object Context {
-    def apply(store: Store, elem: T, build_hosts: List[Build_Cluster.Host] = Nil): Context = {
-      val afp =
-        elem match {
-          case task: Task if task.afp_rev.isDefined => true
-          case job: Job if job.afp_rev.isDefined => true
-          case _ => false
-        }
-
-      new Context(store, store.dir(elem), afp, build_hosts)
-    }
+    def apply(store: Store, elem: T, build_hosts: List[Build_Cluster.Host] = Nil): Context =
+      new Context(store, store.dir(elem), build_hosts)
   }
 
-  class Context private(
-    store: Store,
-    val dir: Path,
-    val afp: Boolean = false,
-    val build_hosts: List[Build_Cluster.Host] = Nil
-  ) {
+  class Context private(store: Store, val dir: Path, val build_hosts: List[Build_Cluster.Host]) {
     def isabelle_dir: Path = dir + Path.basic("isabelle")
-    def afp_dir: Path = isabelle_dir + Path.basic("AFP")
-    def afp_path: Option[Path] = if (afp) Some(afp_dir) else None
 
     private val log_file = dir + Path.basic("log")
     val progress = new File_Progress(log_file, verbose = true)
@@ -995,11 +1011,18 @@ object Build_Manager {
 
     def process(build_config: Build_Config): Bash.Process = {
       val isabelle = Other_Isabelle(isabelle_dir, store.build_manager_identifier, ssh, progress)
-      val afp_settings = afp_path.map(path => "init_component " + quote(path.implode))
-      isabelle.init(other_settings = isabelle.init_components() ::: afp_settings.toList,
+
+      val init_components =
+        for {
+          dir <- build_config.components
+          target = isabelle_dir + Sync.DIRS + Path.basic(dir.name)
+          if Components.is_component_dir(target)
+        } yield "init_component " + quote(target.absolute.implode)
+
+      isabelle.init(other_settings = isabelle.init_components() ::: init_components,
         fresh = build_config.fresh_build, echo = true)
 
-      val cmd = build_config.command(afp_path, build_hosts)
+      val cmd = build_config.command(build_hosts)
       progress.echo("isabelle" + cmd)
 
       val script = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) + cmd
@@ -1055,15 +1078,14 @@ object Build_Manager {
   }
 
   def build_manager(
-    afp_root: Option[Path],
     build_hosts: List[Build_Cluster.Host],
     options: Options,
     port: Int,
+    sync_dirs: List[Sync.Dir] = Nil,
     progress: Progress = new Progress
   ): Unit = {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
-    val afp_repository = Mercurial.repository(afp_root.getOrElse(AFP.BASE))
     val ci_jobs = space_explode(',', options.string("build_manager_ci_jobs"))
     val paths =
       Web_App.Paths(Url(options.string("build_manager_address")), Path.current, true, Page.HOME)
@@ -1073,8 +1095,8 @@ object Build_Manager {
         create = true, label = "Build_Manager.build_manager") {})
 
     val processes = List(
-      new Runner(store, build_hosts, isabelle_repository, afp_repository, progress),
-      new Poller(ci_jobs, store, isabelle_repository, afp_repository, progress),
+      new Runner(store, build_hosts, isabelle_repository, sync_dirs, progress),
+      new Poller(ci_jobs, store, isabelle_repository, sync_dirs, progress),
       new Web_Server(port, paths, store, progress))
 
     val threads = processes.map(Isabelle_Thread.create(_))
@@ -1109,20 +1131,19 @@ object Build_Manager {
     val id = UUID.random()
     val afp_rev = if (afp_root.nonEmpty) Some("") else None
 
-    val build_config = User_Build(prefs, requirements, all_sessions, base_sessions,
+    val build_config = User_Build(afp_rev, prefs, requirements, all_sessions, base_sessions,
       exclude_session_groups, exclude_sessions, session_groups, sessions, build_heap, clean_build,
       export_files, fresh_build, presentation)
-    val task = Task(build_config, id, Date.now(), Priority.high, "", afp_rev)
+    val task = Task(build_config, id, Date.now(), Priority.high)
 
     val context = Context(store, task)
 
     progress.interrupt_handler {
       using(store.open_ssh()) { ssh =>
-        val rsync_context = Rsync.Context(ssh = ssh)
+        val rsync_context = Rsync.Context(ssh = ssh, chmod = "g+rwx")
         progress.echo("Transferring repositories...")
         Sync.sync(store.options, rsync_context, context.isabelle_dir, preserve_jars = true,
           dirs = Sync.afp_dirs(afp_root))
-        ssh.execute("chmod -R ga+rwx " + context.dir)
         if (progress.stopped) {
           progress.echo("Cancelling submission...")
           ssh.rm_tree(context.dir)
@@ -1168,6 +1189,7 @@ object Build_Manager {
   val isabelle_tool = Isabelle_Tool("build_manager", "run build manager", Scala_Project.here,
     { args =>
       var afp_root: Option[Path] = None
+      val dirs = new mutable.ListBuffer[Path]
       val build_hosts = new mutable.ListBuffer[Build_Cluster.Host]
       var options = Options.init()
       var port = 8080
@@ -1177,6 +1199,7 @@ Usage: isabelle build_manager [OPTIONS]
 
   Options are:
     -A ROOT      include AFP with given root directory (":" for """ + AFP.BASE.implode + """)
+    -D DIR       include extra component in given directory
     -H HOSTS     additional cluster host specifications of the form
                  NAMES:PARAMETERS (separated by commas)
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
@@ -1185,6 +1208,7 @@ Usage: isabelle build_manager [OPTIONS]
   Run Isabelle build manager and server frontend, depending on system options:
 """ + Library.indent_lines(2, show_relevant_options(relevant_server_options, options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
+        "D:" -> (arg => dirs += Path.explode(arg)),
         "H:" -> (arg => build_hosts ++= Build_Cluster.Host.parse(Registry.global, arg)),
         "o:" -> (arg => options = options + arg),
         "p:" -> (arg => port = Value.Int.parse(arg)))
@@ -1193,9 +1217,13 @@ Usage: isabelle build_manager [OPTIONS]
       if (more_args.nonEmpty) getopts.usage()
 
       val progress = new Console_Progress()
+      val sync_dirs =
+        Sync.afp_dirs(afp_root) ::: dirs.toList.map(dir => Sync.Dir(dir.file_name, dir))
 
-      build_manager(afp_root = afp_root, build_hosts = build_hosts.toList, options = options,
-        port = port, progress = progress)
+      sync_dirs.foreach(_.check())
+
+      build_manager(build_hosts = build_hosts.toList, options = options, port = port,
+        sync_dirs = sync_dirs, progress = progress)
     })
 
   val relevant_client_options = List("build_manager_dir")
@@ -1265,8 +1293,6 @@ Usage: isabelle build_task [OPTIONS] [SESSIONS ...]
         fresh_build = fresh_build, session_groups = session_groups.toList, sessions = sessions,
         prefs = prefs, exclude_sessions = exclude_sessions.toList, progress = progress)
     })
-
-  // TODO more Isabelle tools, e.g. to cancel builds, edit builds...
 }
 
 class Build_Manager_Tools extends Isabelle_Scala_Tools(
