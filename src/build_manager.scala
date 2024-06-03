@@ -27,26 +27,22 @@ object Build_Manager {
     override def toString: String = name + "/" + rev
   }
 
-  sealed trait T extends Library.Named
-
-  enum Priority { case low, normal, high }
-
   sealed trait Build_Config {
     def name: String
-    def command(build_hosts: List[Build_Cluster.Host]): String
-    def fresh_build: Boolean
     def components: List[Component]
+    def fresh_build: Boolean
+    def command(build_hosts: List[Build_Cluster.Host]): String
   }
 
   case class CI_Build(name: String, components: List[Component]) extends Build_Config {
-    def command(build_hosts: List[Build_Cluster.Host]): String = " " + name
     def fresh_build: Boolean = true
+    def command(build_hosts: List[Build_Cluster.Host]): String = " " + name
   }
 
   object User_Build {
     val name: String = "user"
   }
-  
+
   case class User_Build(
     afp_rev: Option[String] = None,
     prefs: List[Options.Spec] = Nil,
@@ -64,6 +60,7 @@ object Build_Manager {
     presentation: Boolean = false
   ) extends Build_Config {
     def name: String = User_Build.name
+    def components: List[Component] = afp_rev.map(Component.AFP).toList
     def command(build_hosts: List[Build_Cluster.Host]): String = {
       " build" +
         if_proper(afp_rev, " -A:") +
@@ -80,8 +77,11 @@ object Build_Manager {
         " -v" +
         sessions.map(session => " " + Bash.string(session)).mkString
     }
-    def components: List[Component] = afp_rev.map(Component.AFP).toList
   }
+
+  enum Priority { case low, normal, high }
+
+  sealed trait T extends Library.Named
 
   sealed case class Task(
     build_config: Build_Config,
@@ -544,7 +544,7 @@ object Build_Manager {
       progress.echo("Stopped " + name)
     }
 
-    def echo(msg: String) = progress.echo(name + ": "+ msg)
+    def echo(msg: String) = progress.echo(name + ": " + msg)
     def echo_error_message(msg: String) = progress.echo_error_message(name + ": " + msg)
   }
 
@@ -667,7 +667,7 @@ object Build_Manager {
               None
           }
         }
-    }
+      }
 
     private def stop_cancelled(state: Runner.State): Runner.State =
       synchronized_database("stop_cancelled") {
@@ -688,7 +688,7 @@ object Build_Manager {
         _state = _state
           .remove_running(job.name)
           .add_finished(result)
-    }
+      }
 
     override def stopped(state: Runner.State): Boolean = progress.stopped && state.is_empty
 
@@ -727,18 +727,18 @@ object Build_Manager {
     override def delay = options.seconds("build_manager_poll_delay")
 
     private def ids: List[String] = isabelle_repository.id() :: sync_dirs.map(_.hg.id())
-    val init: Poller.State = Poller.State(ids, poll)
-
-    def ci_task(name: String): Task =
-      Task(CI_Build(name, sync_dirs.map(dir => Component(dir.name, "tip"))),
-        priority = Priority.low, isabelle_rev = "tip")
-
     private def poll: Future[List[String]] = Future.fork {
       Par_List.map((repo: Mercurial.Repository) => repo.pull(),
         isabelle_repository :: sync_dirs.map(_.hg))
 
       ids
     }
+
+    val init: Poller.State = Poller.State(ids, poll)
+
+    def ci_task(name: String): Task =
+      Task(CI_Build(name, sync_dirs.map(dir => Component(dir.name, "tip"))),
+        priority = Priority.low, isabelle_rev = "tip")
 
     private def add_task(): Unit = synchronized_database("add_task") {
       for (name <- ci_jobs if !_state.pending.values.exists(_.kind == name)) {
@@ -970,7 +970,7 @@ object Build_Manager {
     def init: Unit = server.start()
     def loop_body(u: Unit): Unit = {
       if (progress.stopped) server.stop()
-      else synchronized_database("iterate") { }
+      else synchronized_database("iterate") {}
     }
   }
 
@@ -1076,6 +1076,9 @@ object Build_Manager {
         ssh_port = options.int("build_manager_ssh_port"),
         ssh_user = options.string("build_manager_ssh_user"))
   }
+
+
+  /* build manager */
 
   def build_manager(
     build_hosts: List[Build_Cluster.Host],
