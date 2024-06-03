@@ -999,24 +999,11 @@ object Build_Manager {
       isabelle.init(other_settings = isabelle.init_components() ::: afp_settings.toList,
         fresh = build_config.fresh_build, echo = true)
 
-      // TODO this requires Other_Isabelle.bash / ssh.execute / ssh.run_command to give access to bash process
-      val cmd = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) +
-        build_config.command(afp_path, build_hosts)
-      progress.echo(cmd)
+      val cmd = build_config.command(afp_path, build_hosts)
+      progress.echo("isabelle" + cmd)
 
-      val env = Isabelle_System.export_env(
-        user_home = ssh.user_home,
-        isabelle_identifier = isabelle.isabelle_identifier)
-
-      val cmd_line = env + "cd " + ssh.bash_path(isabelle.isabelle_home) + "\n" + cmd
-      val script = Isabelle_System.export_env(user_home = ssh.user_home) + cmd_line
-      val args = Bash.string(ssh.host) + " " + Bash.string(script)
-
-      val config = SSH.Config.make(ssh.options, port = ssh.port, user = ssh.user, control_path =
-        ssh.control_path)
-
-      val ssh_cmd = SSH.Config.command("ssh", config) + if_proper(args, " -- " + args)
-      Bash.process(ssh_cmd, env = null)
+      val script = File.bash_path(Isabelle_Tool.exe(isabelle.isabelle_home)) + cmd
+      ssh.bash_process(isabelle.bash_context(script), settings = false)
     }
 
     def run(process: Bash.Process): Process_Result = {
