@@ -766,21 +766,51 @@ object Build_Manager {
 
   /* web server */
 
-  object Page {
-    val HOME = Path.basic("home")
-    val OVERVIEW = Path.basic("overview")
-    val BUILD = Path.basic("build")
-  }
+  object Web_Server {
+    object Page {
+      val HOME = Path.basic("home")
+      val OVERVIEW = Path.basic("overview")
+      val BUILD = Path.basic("build")
+    }
 
-  object API {
-    val BUILD_CANCEL = Path.explode("api/build/cancel")
-    val CSS = Path.explode("api/isabelle.css")
+    object API {
+      val BUILD_CANCEL = Path.explode("api/build/cancel")
+      val CSS = Path.explode("api/isabelle.css")
+    }
+
+    object Cache {
+      def empty: Cache = new Cache()
+    }
+
+    class Cache private(keep: Time = Time.minutes(1)) {
+      var logs: Map[String, (Time, String)] = Map.empty
+
+      def update(store: Store, state: State): Unit = synchronized {
+        logs =
+          for {
+            (name, (time, log)) <- logs
+            if time + keep > Time.now()
+          } yield name -> (time, Context(store, state.get(name).get).log)
+      }
+
+      def lookup(store: Store, elem: T): String = synchronized {
+        logs.get(elem.name) match {
+          case Some((_, log)) =>
+            logs += elem.name -> (Time.now(), log)
+          case None =>
+            logs += elem.name -> (Time.now(), Context(store, elem).log)
+        }
+        logs(elem.name)._2
+      }
+    }
   }
 
   class Web_Server(port: Int, paths: Web_App.Paths, store: Store, progress: Progress)
     extends Loop_Process[Unit]("Web_Server", store, progress) {
     import Web_App.*
+    import Web_Server.*
 
+    val cache = Cache.empty
     val Id = new Properties.String(Markup.ID)
 
     enum Model {
@@ -887,11 +917,11 @@ object Build_Manager {
               if (job.cancelled) text("Cancelling...")
               else text("Running...") ::: render_cancel(job.id)) ::
             render_rev(job.isabelle_rev, job.components) :::
-            source(Context(store, job).log) :: Nil
+            source(cache.lookup(store, job)) :: Nil
           case result: Result =>
             par(text("Date: " + result.date)) ::
             par(text("Status: " + result.status)) ::
-            source(Context(store, result).log) :: Nil
+            source(cache.lookup(store, result)) :: Nil
         })
       }
 
@@ -970,7 +1000,7 @@ object Build_Manager {
     def init: Unit = server.start()
     def loop_body(u: Unit): Unit = {
       if (progress.stopped) server.stop()
-      else synchronized_database("iterate") {}
+      else synchronized_database("iterate") { cache.update(store, _state) }
     }
   }
 
@@ -1090,8 +1120,8 @@ object Build_Manager {
     val store = Store(options)
     val isabelle_repository = Mercurial.self_repository()
     val ci_jobs = space_explode(',', options.string("build_manager_ci_jobs"))
-    val paths =
-      Web_App.Paths(Url(options.string("build_manager_address")), Path.current, true, Page.HOME)
+    val url = Url(options.string("build_manager_address"))
+    val paths = Web_App.Paths(url, Path.current, true, Web_Server.Page.HOME)
 
     using(store.open_database())(db =>
       Build_Manager.private_data.transaction_lock(db,
