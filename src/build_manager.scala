@@ -1214,10 +1214,12 @@ object Build_Manager {
 
   private val relevant_server_options =
     List(
+      "build_manager_dir",
+      "build_manager_server_address",
+      "build_manager_identifier",
       "build_manager_delay",
       "build_manager_poll_delay",
-      "build_manager_dir",
-      "build_manager_identifier")
+      "build_manager_ci_jobs")
 
   val isabelle_tool = Isabelle_Tool("build_manager", "run build manager", Scala_Project.here,
     { args =>
@@ -1259,7 +1261,7 @@ Usage: isabelle build_manager [OPTIONS]
         sync_dirs = sync_dirs, progress = progress)
     })
 
-  val relevant_client_options = List("build_manager_dir")
+  val relevant_client_options = List("build_manager_dir", "build_manager_address")
 
   val isabelle_tool1 = Isabelle_Tool("build_task", "submit build task for build manager",
     Scala_Project.here,
