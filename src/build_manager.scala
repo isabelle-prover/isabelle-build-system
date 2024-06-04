@@ -1040,7 +1040,7 @@ object Build_Manager {
     lazy val ssh = store.open_ssh()
 
     def process(build_config: Build_Config): Bash.Process = {
-      val isabelle = Other_Isabelle(isabelle_dir, store.build_manager_identifier, ssh, progress)
+      val isabelle = Other_Isabelle(isabelle_dir, store.identifier, ssh, progress)
 
       val init_components =
         for {
@@ -1072,7 +1072,7 @@ object Build_Manager {
 
   case class Store(options: Options) {
     val base_dir = Path.explode(options.string("build_manager_dir"))
-    val build_manager_identifier = options.string("build_manager_identifier")
+    val identifier = options.string("build_manager_identifier")
 
     def dir(elem: T): Path = base_dir + (
       elem match {
@@ -1190,8 +1190,8 @@ object Build_Manager {
               }
             }
           }
-          val address = options.string("build_manager_address")
-          progress.echo("Submitted task. See " + address + "/build?id=" + task.id)
+          val address = options.string("build_manager_address") + "/build?id=" + task.id
+          progress.echo("Submitted task. Private url: " + address)
         }
       }
     }
@@ -1202,23 +1202,14 @@ object Build_Manager {
 
   /* Isabelle tool wrapper */
 
-  private def show_relevant_options(relevant: List[String], options: Options): String = {
-    val connection_options =
-      for {
-        option <- options.iterator
-        if option.name.startsWith("build_manager") && option.for_tag(Options.TAG_CONNECTION)
-      } yield option
+  private def show_options(relevant_options: List[String], options: Options): String =
+    cat_lines(relevant_options.flatMap(options.get).map(_.print))
 
-    cat_lines((relevant.flatMap(options.get) ::: connection_options.toList).map(_.print))
-  }
-
-  private val relevant_server_options =
+  private val notable_server_options =
     List(
       "build_manager_dir",
-      "build_manager_server_address",
-      "build_manager_identifier",
-      "build_manager_delay",
-      "build_manager_poll_delay",
+      "build_manager_address",
+      "build_manager_ssh_host",
       "build_manager_ci_jobs")
 
   val isabelle_tool = Isabelle_Tool("build_manager", "run build manager", Scala_Project.here,
@@ -1240,8 +1231,9 @@ Usage: isabelle build_manager [OPTIONS]
     -o OPTION    override Isabelle system OPTION (via NAME=VAL or NAME)
     -p PORT      explicit web server port
 
-  Run Isabelle build manager and server frontend, depending on system options:
-""" + Library.indent_lines(2, show_relevant_options(relevant_server_options, options)) + "\n",
+  Run Isabelle build manager. Notable system options:
+
+""" + Library.indent_lines(2, show_options(notable_server_options, options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "D:" -> (arg => dirs += Path.explode(arg)),
         "H:" -> (arg => build_hosts ++= Build_Cluster.Host.parse(Registry.global, arg)),
@@ -1260,8 +1252,6 @@ Usage: isabelle build_manager [OPTIONS]
       build_manager(build_hosts = build_hosts.toList, options = options, port = port,
         sync_dirs = sync_dirs, progress = progress)
     })
-
-  val relevant_client_options = List("build_manager_dir", "build_manager_address")
 
   val isabelle_tool1 = Isabelle_Tool("build_task", "submit build task for build manager",
     Scala_Project.here,
@@ -1300,8 +1290,9 @@ Usage: isabelle build_task [OPTIONS] [SESSIONS ...]
     -p OPTIONS   comma-separated preferences for build process
     -x NAME      exclude session NAME and all descendants
 
-  Submit build on SSH server, depending on system options:
-""" + Library.indent_lines(2, show_relevant_options(relevant_client_options, options)) + "\n",
+  Submit build task on SSH server. Notable system options:
+
+""" + Library.indent_lines(2, show_options(List("build_manager_ssh_user"), options)) + "\n",
         "A:" -> (arg => afp_root = Some(if (arg == ":") AFP.BASE else Path.explode(arg))),
         "B:" -> (arg => base_sessions += arg),
         "P" -> (_ => presentation = true),
