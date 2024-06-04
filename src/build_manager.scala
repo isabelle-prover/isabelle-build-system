@@ -37,7 +37,7 @@ object Build_Manager {
 
   case class CI_Build(name: String, components: List[Component]) extends Build_Config {
     def fresh_build: Boolean = true
-    def command(build_hosts: List[Build_Cluster.Host]): String = " " + name
+    def command(build_hosts: List[Build_Cluster.Host]): String = " ci_build " + name
   }
 
   object User_Build {
