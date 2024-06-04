@@ -1,7 +1,8 @@
-/*  Author:     Fabian Huch, TU Muenchen
+/*  Title:      Pure/Build/build_manager.scala
+    Author:     Fabian Huch, TU Muenchen
 
-Isabelle system for automated and quasi-interactive build, with web frontend.
- */
+Isabelle manager for automated and quasi-interactive builds, with web frontend.
+*/
 
 package isabelle
 
