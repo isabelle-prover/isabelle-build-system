@@ -1075,12 +1075,6 @@ object Build_Manager {
     val base_dir = Path.explode(options.string("build_manager_dir"))
     val identifier = options.string("build_manager_identifier")
 
-    def init(): Unit = {
-      val pending = base_dir + Path.basic("pending")
-      Isabelle_System.make_directory(pending)
-      Isabelle_System.chmod("g+rwx", pending)
-    }
-
     def dir(elem: T): Path = base_dir + (
       elem match {
         case task: Task => Path.make(List("pending", task.id.toString))
@@ -1130,7 +1124,6 @@ object Build_Manager {
     val url = Url(options.string("build_manager_address"))
     val paths = Web_App.Paths(url, Path.current, true, Web_Server.Page.HOME)
 
-    store.init()
     using(store.open_database())(db =>
       Build_Manager.private_data.transaction_lock(db,
         create = true, label = "Build_Manager.build_manager") {})
