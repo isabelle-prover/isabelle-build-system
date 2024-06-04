@@ -740,8 +740,8 @@ object Build_Manager {
     val init: Poller.State = Poller.State(ids, poll)
 
     def ci_task(name: String): Task =
-      Task(CI_Build(name, sync_dirs.map(dir => Component(dir.name, "tip"))),
-        priority = Priority.low, isabelle_rev = "tip")
+      Task(CI_Build(name, sync_dirs.map(dir => Component(dir.name, "default"))),
+        priority = Priority.low, isabelle_rev = "default")
 
     private def add_task(): Unit = synchronized_database("add_task") {
       for (name <- ci_jobs if !_state.pending.values.exists(_.kind == name)) {
