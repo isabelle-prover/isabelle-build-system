@@ -727,7 +727,9 @@ object Build_Manager {
 
     override def delay = options.seconds("build_manager_poll_delay")
 
-    private def ids: List[String] = isabelle_repository.id() :: sync_dirs.map(_.hg.id())
+    private def ids: List[String] =
+      isabelle_repository.id("default") :: sync_dirs.map(_.hg.id("default"))
+
     private def poll: Future[List[String]] = Future.fork {
       Par_List.map((repo: Mercurial.Repository) => repo.pull(),
         isabelle_repository :: sync_dirs.map(_.hg))
